@@ -1,0 +1,36 @@
+{
+  "name": "mingocell-api",
+  "version": "1.0.0",
+  "description": "MingoCell Express API",
+  "main": "dist/server.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "dev": "npm run build && npm start",
+    "build": "tsc",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "test": "npm run build && node --test tests/server.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mingotrees/Mingocell-api.git"
+  },
+  "keywords": [],
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bugs": {
+    "url": "https://github.com/Mingotrees/Mingocell-api/issues"
+  },
+  "homepage": "https://github.com/Mingotrees/Mingocell-api#readme",
+  "dependencies": {
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  }
+}

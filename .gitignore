@@ -78,11 +78,13 @@ web_modules/
 .next
 out
 
-# Nuxt.js build / generate output
+# TypeScript build output and framework build artifacts
 .nuxt
 dist
 .output
 
+
+docs/
 # Gatsby files
 .cache/
 # Comment in the public line in if your project uses Gatsby and not Next.js
@@ -141,3 +143,29 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Local PM2 state (keep ecosystem.config.* tracked)
+.pm2/
+
+# Private uploaded images and temporary files
+/uploads/
+/storage/
+/tmp/
+/temp/
+
+# Local database dumps and backups
+*.dump
+*.backup
+
+# Local credentials and private keys
+.pgpass
+*.pem
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor swap files
+*.swp
+*.swo
