@@ -21,6 +21,7 @@ export type AuthOptions = {
   store: session.Store;
   secret: string;
   secureCookies: boolean;
+  trustLocalHttpsProxy: boolean;
   origins: string[];
 };
 
@@ -49,7 +50,22 @@ export function authOptions(pool: Pool, store: session.Store): AuthOptions {
       throw new Error("CORS_ORIGINS must contain exact HTTP(S) origins without trailing slashes.");
     }
   }
-  return { pool, store, secret, origins, secureCookies: process.env.NODE_ENV !== "development" };
+  const proxySetting = process.env.TRUST_LOCAL_HTTPS_PROXY ?? "false";
+  if (!["true", "false"].includes(proxySetting)) {
+    throw new Error("TRUST_LOCAL_HTTPS_PROXY must be true or false.");
+  }
+  const secureCookies = process.env.NODE_ENV !== "development";
+  const trustLocalHttpsProxy = proxySetting === "true";
+  if (trustLocalHttpsProxy && !secureCookies) {
+    throw new Error("TRUST_LOCAL_HTTPS_PROXY is only valid in production.");
+  }
+  return { pool, store, secret, origins, secureCookies, trustLocalHttpsProxy };
+}
+
+export function validateProxyBinding(host: string, options: AuthOptions) {
+  if (options.trustLocalHttpsProxy && !["127.0.0.1", "::1"].includes(host)) {
+    throw new Error("TRUST_LOCAL_HTTPS_PROXY requires HOST=127.0.0.1 or HOST=::1.");
+  }
 }
 
 export class HttpError extends Error {

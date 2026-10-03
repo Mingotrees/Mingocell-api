@@ -10,6 +10,17 @@ export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOpti
 
   app.disable("x-powered-by");
   if (auth?.secureCookies) app.set("trust proxy", "loopback");
+  if (auth?.trustLocalHttpsProxy) {
+    app.use((req, _res, next) => {
+      const address = req.socket.remoteAddress ?? "";
+      if (address !== "127.0.0.1" && address !== "::1" && address !== "::ffff:127.0.0.1") {
+        return next(new HttpError(403, "PROXY_FORBIDDEN", "Request did not arrive through the local proxy."));
+      }
+      // DCISM terminates TLS locally but does not forward X-Forwarded-Proto.
+      req.headers["x-forwarded-proto"] = "https";
+      next();
+    });
+  }
   app.use(helmet());
   app.use((_req, res, next) => {
     res.locals.requestId = randomUUID();

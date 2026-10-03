@@ -1,15 +1,18 @@
 import { createApp } from "./app.js";
 import { pool } from "./database/pool.js";
-import { authOptions, createSessionStore } from "./auth/middleware.js";
+import { authOptions, createSessionStore, validateProxyBinding } from "./auth/middleware.js";
 
-const store = createSessionStore(pool);
-const app = createApp(() => pool.query("SELECT 1"), authOptions(pool, store));
 const port = Number(process.env.PORT ?? 20282);
 const host = process.env.HOST ?? "127.0.0.1";
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("PORT must be an integer between 1 and 65535.");
 }
+
+const store = createSessionStore(pool);
+const authentication = authOptions(pool, store);
+validateProxyBinding(host, authentication);
+const app = createApp(() => pool.query("SELECT 1"), authentication);
 
 const server = app.listen(port, host, () => {
   console.log(`MingoCell API listening on ${host}:${port}`);

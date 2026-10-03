@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import pg from "pg";
 import { createApp } from "../dist/app.js";
-import { createSessionStore, requireRole } from "../dist/auth/middleware.js";
+import { createSessionStore, requireRole, validateProxyBinding } from "../dist/auth/middleware.js";
 import { createAccount, updateAccount } from "../dist/auth/accounts.js";
 import { migrate } from "../dist/database/migration-runner.js";
 import { hashPassword, normalizeEmail, verifyPassword } from "../dist/auth/passwords.js";
@@ -32,6 +33,11 @@ test("pathologist permission excludes admin and anonymous users", () => {
     });
     assert.equal(called, true);
   }
+  assert.throws(
+    () => validateProxyBinding("0.0.0.0", { trustLocalHttpsProxy: true }),
+    /requires HOST=127\.0\.0\.1/,
+  );
+  assert.doesNotThrow(() => validateProxyBinding("127.0.0.1", { trustLocalHttpsProxy: true }));
 });
 
 test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DATABASE_URL }, async (t) => {
@@ -39,16 +45,33 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   assert.equal(url.pathname, "/mingocell_test", "Integration tests require isolated mingocell_test database");
   const pool = new pg.Pool({ connectionString: url.toString(), max: 5, connectionTimeoutMillis: 5000 });
   t.after(() => pool.end());
+  // Reproduce production state: migration 001 was already applied before the
+  // maintainer role was renamed. Migration 002 must preserve checksum history.
+  const firstSql = await readFile(new URL("../migrations/001_auth.sql", import.meta.url), "utf8");
+  const firstChecksum = createHash("sha256").update(firstSql).digest("hex");
+  await pool.query(`CREATE TABLE public.mingocell_migrations (
+    name text PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await pool.query(firstSql);
+  await pool.query("INSERT INTO public.mingocell_migrations (name, checksum) VALUES ($1, $2)",
+    ["001_auth.sql", firstChecksum]);
+  const legacyUser = randomUUID();
+  await pool.query(`INSERT INTO mingocell_auth.users (id, email, password_hash, role)
+    VALUES ($1, $2, 'legacy-test-hash', 'maintainer')`, [legacyUser, `${legacyUser}@example.org`]);
   await migrate(pool);
   await migrate(pool); // Re-running migrations must preserve existing schema/data.
   const migrations = await pool.query("SELECT count(*)::int AS count FROM public.mingocell_migrations");
-  assert.equal(migrations.rows[0].count, 1);
+  assert.equal(migrations.rows[0].count, 2);
+  const migratedUser = await pool.query("SELECT role FROM mingocell_auth.users WHERE id = $1", [legacyUser]);
+  assert.equal(migratedUser.rows[0].role, "admin");
 
   const origin = "http://localhost:3000";
   const secret = "isolated-test-session-secret-32-characters";
-  async function start(secureCookies = false) {
+  async function start({ secureCookies = false, trustLocalHttpsProxy = false } = {}) {
     const store = createSessionStore(pool);
-    const app = createApp(() => pool.query("SELECT 1"), { pool, store, secret, secureCookies, origins: [origin] });
+    const app = createApp(() => pool.query("SELECT 1"), {
+      pool, store, secret, secureCookies, trustLocalHttpsProxy, origins: [origin],
+    });
     const server = app.listen(0, "127.0.0.1");
     t.after(async () => {
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -63,14 +86,13 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   await createAccount(pool, email.toUpperCase(), password, "pathologist");
   await assert.rejects(createAccount(pool, email, password, "pathologist"), { code: "23505" });
 
-  function browser(host = base, secure = false) {
+  function browser(host = base) {
     return {
       cookie: "", csrf: "",
       async request(path, { method = "GET", body, csrf = true, requestOrigin = origin, raw } = {}) {
         const headers = { Origin: requestOrigin };
         if (this.cookie) headers.Cookie = this.cookie;
         if (csrf && this.csrf) headers["X-CSRF-Token"] = this.csrf;
-        if (secure) headers["X-Forwarded-Proto"] = "https";
         if (body !== undefined || raw !== undefined) headers["Content-Type"] = "application/json";
         const response = await fetch(`${host}${path}`, {
           method, headers, body: raw ?? (body === undefined ? undefined : JSON.stringify(body)),
@@ -181,8 +203,8 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
     assert.equal((await weekBrowser.login(false, "Changed test password 123!")).status, 401);
   });
 
-  await t.test("production cookie is secure and host-only behind trusted proxy", async () => {
-    const client = browser(await start(true), true);
+  await t.test("production cookie is secure through DCISM loopback TLS proxy mode", async () => {
+    const client = browser(await start({ secureCookies: true, trustLocalHttpsProxy: true }));
     const response = await client.request("/api/v1/auth/session");
     assert.match(response.headers.get("set-cookie"), /^__Host-mingocell\.sid=/);
     assert.match(response.headers.get("set-cookie"), /; Secure/);

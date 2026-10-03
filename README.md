@@ -145,6 +145,19 @@ paste them into logs. Changing the secret invalidates existing signed cookies.
 `CORS_ORIGINS` defaults to `https://mingocell.dcism.org,http://localhost:3000`;
 use exact origins without trailing slashes. Do not set a wildcard.
 
+DCISM Apache terminates HTTPS on the same server but does not forward the
+original protocol. Its production `.env` must therefore contain:
+
+```dotenv
+HOST=127.0.0.1
+TRUST_LOCAL_HTTPS_PROXY=true
+```
+
+This mode overwrites forwarding protocol data only for loopback connections and
+refuses to start on a public bind address. Leave it false locally. It preserves
+Secure, HttpOnly, host-only cookies without trusting internet-supplied proxy
+headers.
+
 Run account commands **on the server**, from the backend directory after migrations:
 
 ```bash
@@ -165,6 +178,8 @@ Migrations run transactionally with a database lock and checksum tracking. Run
 `npm run build && npm run migrate` locally before starting. CI/CD runs migrations
 automatically on production before restarting PM2. Do not edit an applied SQL
 migration; add a new numbered file for later schema changes.
+Migration `002_rename_maintainer_to_admin.sql` preserves the checksum of the
+already-deployed first migration while converting its original role name.
 
 ## Authentication API contract
 
@@ -215,9 +230,9 @@ production (`__Host-mingocell.sid`). Local development uses `mingocell.sid`
 without Secure; use the local frontend with the local API, not the production
 API, because SameSite cookies do not work across unrelated sites.
 
-Apache must forward HTTPS as `X-Forwarded-Proto: https` and overwrite incoming
-forwarding headers. Express trusts loopback proxies only. Existing school HTTPS
-reverse proxy is expected to connect over loopback.
+Express trusts loopback proxies only. `TRUST_LOCAL_HTTPS_PROXY=true` handles the
+school proxy's missing protocol header and is safe only while `HOST` remains a
+loopback address.
 
 Errors use `{error: {code, message}}`: invalid input/JSON (400), invalid
 credentials or missing/expired authentication (401), rejected origin/CSRF or
