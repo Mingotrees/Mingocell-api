@@ -1,0 +1,115 @@
+name: Test and deploy to DCISM
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dcism-backend-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Test, build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test and build
+        run: |
+          npm test
+          test -f dist/server.js
+
+      - name: Deploy backend
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DCISM_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DCISM_KNOWN_HOSTS }}
+          DCISM_HOST: ${{ secrets.DCISM_HOST }}
+          DCISM_PORT: ${{ secrets.DCISM_PORT }}
+          DCISM_USER: ${{ secrets.DCISM_USER }}
+          DCISM_DEPLOY_PATH: ${{ secrets.DCISM_DEPLOY_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Validate destination before transferring or deleting compiled files.
+          [[ "$DCISM_HOST" == "ver.dcism.org" ]]
+          [[ "$DCISM_PORT" == "22072" ]]
+          [[ "$DCISM_USER" == "s22101440" ]]
+          [[ "$DCISM_DEPLOY_PATH" == "/data/users/s22101440/api-mingocell.dcism.org" ]]
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+
+          install -d -m 700 "$HOME/.ssh"
+          KEY_FILE=$(mktemp "$HOME/.ssh/dcism-key.XXXXXX")
+          HOSTS_FILE=$(mktemp "$HOME/.ssh/dcism-hosts.XXXXXX")
+          trap 'rm -f "$KEY_FILE" "$HOSTS_FILE"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$KEY_FILE"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOSTS_FILE"
+          chmod 600 "$KEY_FILE" "$HOSTS_FILE"
+          unset SSH_PRIVATE_KEY SSH_KNOWN_HOSTS
+
+          SSH_COMMAND="ssh -i $KEY_FILE -p $DCISM_PORT"
+          SSH_COMMAND+=" -o UserKnownHostsFile=$HOSTS_FILE"
+          SSH_COMMAND+=" -o BatchMode=yes -o IdentitiesOnly=yes"
+          SSH_COMMAND+=" -o StrictHostKeyChecking=yes -o ConnectTimeout=20"
+          SSH_COMMAND+=" -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
+          TARGET="$DCISM_USER@$DCISM_HOST"
+
+          # Confirm existing deployment and tools before changing files.
+          $SSH_COMMAND "$TARGET" "bash -se" <<'REMOTE'
+          set -euo pipefail
+          cd /data/users/s22101440/api-mingocell.dcism.org
+          test -w .
+          for tool in node npm pm2 rsync curl; do
+            command -v "$tool" >/dev/null
+          done
+          node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
+          pm2 describe mingocell-api >/dev/null
+          REMOTE
+
+          # Only dist/ is mirrored with deletion. Persistent files stay untouched.
+          rsync -az --delete-delay --delay-updates --timeout=120 \
+            -e "$SSH_COMMAND" dist/ "$TARGET:$DCISM_DEPLOY_PATH/dist/"
+          rsync -az --delay-updates --timeout=120 \
+            -e "$SSH_COMMAND" package.json package-lock.json "$TARGET:$DCISM_DEPLOY_PATH/"
+
+          $SSH_COMMAND "$TARGET" "bash -se" <<'REMOTE'
+          set -euo pipefail
+          cd /data/users/s22101440/api-mingocell.dcism.org
+          npm ci --omit=dev
+          pm2 restart mingocell-api --update-env
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+            --retry 10 --retry-delay 2 --retry-all-errors --retry-max-time 90 \
+            http://127.0.0.1:20282/health/live
+          REMOTE
+
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+            --retry 10 --retry-delay 2 --retry-all-errors --retry-max-time 90 \
+            https://api-mingocell.dcism.org/health/live \
+            | node --input-type=module -e '
+              import assert from "node:assert/strict";
+              let body = "";
+              for await (const chunk of process.stdin) body += chunk;
+              assert.deepEqual(JSON.parse(body), { status: "ok", service: "mingocell-api" });
+              console.log("Public API health check passed");
+            '
