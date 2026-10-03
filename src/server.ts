@@ -1,8 +1,9 @@
-import { time } from "node:console";
 import { createApp } from "./app.js";
-import { pool } from "./db.js";
+import { pool } from "./database/pool.js";
+import { authOptions, createSessionStore } from "./auth/middleware.js";
 
-const app = createApp(() => pool.query("SELECT 1"));
+const store = createSessionStore(pool);
+const app = createApp(() => pool.query("SELECT 1"), authOptions(pool, store));
 const port = Number(process.env.PORT ?? 20282);
 const host = process.env.HOST ?? "127.0.0.1";
 
@@ -28,6 +29,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
       let exitCode = error ? 1 : 0;
 
       try {
+        store.close();
         await pool.end();
       } catch {
         console.error("Failed to close PostgresSQL connections.");

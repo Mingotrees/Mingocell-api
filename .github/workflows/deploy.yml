@@ -19,6 +19,20 @@ jobs:
     name: Test, build and deploy
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: mingocell_test
+          POSTGRES_USER: mingocell_test
+          POSTGRES_PASSWORD: ci-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mingocell_test -d mingocell_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout repository
@@ -34,8 +48,11 @@ jobs:
         run: npm ci
 
       - name: Test and build
+        env:
+          TEST_DATABASE_URL: postgresql://mingocell_test:ci-test-only@127.0.0.1:5432/mingocell_test
         run: |
           npm test
+          python3 tests/account-cli.py
           test -f dist/server.js
 
       - name: Deploy backend
@@ -84,6 +101,12 @@ jobs:
             command -v "$tool" >/dev/null
           done
           node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
+          node --env-file-if-exists=.env -e '
+            if ((process.env.SESSION_SECRET ?? "").length < 32) {
+              console.error("Set SESSION_SECRET in server .env before deploying authentication.");
+              process.exit(1);
+            }
+          '
           pm2 describe mingocell-api >/dev/null
           REMOTE
 
@@ -92,15 +115,21 @@ jobs:
             -e "$SSH_COMMAND" dist/ "$TARGET:$DCISM_DEPLOY_PATH/dist/"
           rsync -az --delay-updates --timeout=120 \
             -e "$SSH_COMMAND" package.json package-lock.json "$TARGET:$DCISM_DEPLOY_PATH/"
+          rsync -az --delay-updates --timeout=120 \
+            -e "$SSH_COMMAND" migrations/ "$TARGET:$DCISM_DEPLOY_PATH/migrations/"
 
           $SSH_COMMAND "$TARGET" "bash -se" <<'REMOTE'
           set -euo pipefail
           cd /data/users/s22101440/api-mingocell.dcism.org
           npm ci --omit=dev
+          npm run migrate
           pm2 restart mingocell-api --update-env
           curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
             --retry 10 --retry-delay 2 --retry-all-errors --retry-max-time 90 \
             http://127.0.0.1:20282/health/live
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+            --retry 10 --retry-delay 2 --retry-all-errors --retry-max-time 90 \
+            http://127.0.0.1:20282/health/ready
           REMOTE
 
           curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
@@ -113,3 +142,20 @@ jobs:
               assert.deepEqual(JSON.parse(body), { status: "ok", service: "mingocell-api" });
               console.log("Public API health check passed");
             '
+
+          # Confirm Apache forwards HTTPS correctly and the browser can get a secure cookie.
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            const response = await fetch("https://api-mingocell.dcism.org/api/v1/auth/session", {
+              headers: { Origin: "https://mingocell.dcism.org" },
+              signal: AbortSignal.timeout(10000),
+            });
+            assert.equal(response.status, 200);
+            const cookie = response.headers.get("set-cookie") ?? "";
+            assert.ok(cookie.startsWith("__Host-mingocell.sid="), "Missing production session cookie");
+            assert.ok(cookie.includes("; Secure") && cookie.includes("; HttpOnly"), "Invalid cookie flags");
+            const session = await response.json();
+            assert.equal(session.user, null);
+            assert.ok(/^[a-f0-9]{64}$/.test(session.csrfToken), "Missing CSRF bootstrap token");
+            console.log("Public authentication bootstrap passed");
+          '

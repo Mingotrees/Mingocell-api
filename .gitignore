@@ -169,3 +169,6 @@ Thumbs.db
 # Editor swap files
 *.swp
 *.swo
+
+# Generated Graphify analysis and visualizations
+/graphify-out/

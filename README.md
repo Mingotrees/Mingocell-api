@@ -2,10 +2,38 @@
 
 Express 5 + TypeScript. Requires Node.js 24 or newer.
 
+## Source structure
+
+```text
+src/
+├── app.ts                       Express app, global middleware, health checks, errors
+├── server.ts                    HTTP startup and graceful shutdown
+├── database/
+│   ├── pool.ts                  PostgreSQL connection pool
+│   └── migration-runner.ts      Transactional SQL migration runner
+├── auth/
+│   ├── routes.ts                Session, login, and logout endpoints
+│   ├── middleware.ts            Sessions, CSRF, account checks, role guards, configuration
+│   ├── accounts.ts              Account creation, password reset, deactivation
+│   └── passwords.ts             Email validation and password hashing/verification
+└── cli/
+    ├── manage-account.ts        Hidden-prompt account management command
+    └── migrate-database.ts      Migration command entry point
+```
+
+`server.ts` connects the database pool and auth configuration to `app.ts`.
+Auth routes install their middleware before registering endpoints. Server-only
+maintenance commands live in `cli/`; SQL files remain in root `migrations/`.
+Builds clean `dist/` before compiling so renamed modules cannot leave stale output.
+Run commands through `npm run account` and `npm run migrate`; compiled CLI files
+now live under `dist/cli/`.
+
 ## Local development
 
 ```bash
 npm install
+npm run build
+npm run migrate
 npm run dev
 ```
 
@@ -18,8 +46,14 @@ curl http://127.0.0.1:20282/health/live
 npm test
 ```
 
-Health returns `{"status":"ok","service":"mingocell-api"}`. This is process
-liveness only; database and inference are not connected yet.
+Set the `DB_*` variables and `SESSION_SECRET` in local `.env` before starting.
+Local school-database access requires your SSH tunnel; its host/port can differ
+from production. `npm run dev` uses development cookies for local HTTP;
+`npm start` forces production mode with secure cookies.
+
+Liveness returns `{"status":"ok","service":"mingocell-api"}`. Database readiness
+is `GET /health/ready`, returning `{"status":"ready"}` or HTTP 503.
+Inference is not connected yet.
 
 ## PM2
 
@@ -28,6 +62,7 @@ Run from the project directory, on the machine hosting the API:
 ```bash
 npm ci
 npm run build
+npm run migrate
 pm2 start npm --name mingocell-api -- start
 pm2 list
 pm2 logs mingocell-api
@@ -42,6 +77,7 @@ After updating source:
 ```bash
 npm ci
 npm run build
+npm run migrate
 pm2 restart mingocell-api --update-env
 ```
 
@@ -76,15 +112,137 @@ The server directory must already exist and PM2 must already manage
 available in noninteractive SSH sessions. Target settings are checked against
 fixed assertions in the workflow; update both if the destination changes.
 
-Deployment uploads compiled `dist/` and the package manifests, installs
-production dependencies, and restarts PM2. Only obsolete files inside `dist/`
+Deployment uploads compiled `dist/`, SQL migrations, and the package manifests,
+installs production dependencies, runs migrations, and restarts PM2. Only obsolete files inside `dist/`
 are deleted. Server `.env` is preserved; keep private images and other persistent
 data outside `dist/`, preferably outside the deployment directory.
 
-After restart, local and public HTTPS health checks must pass. Inspect each run
+Before upload, the workflow requires a configured server `SESSION_SECRET`.
+After restart, local liveness/readiness and public HTTPS liveness/authentication
+bootstrap checks must pass. Inspect each run
 in **Actions → Test and deploy to DCISM**. Backend deployments are serialized.
 
 Updates happen in place and may briefly interrupt requests. There is no automatic
 rollback: if installation, restart, or verification fails, inspect PM2 logs and
 redeploy a known-good revision. A successful health check confirms liveness,
 not database readiness or inference availability.
+
+## Authentication setup
+
+Accounts are provisioned by an administrator; there is no public signup.
+Email addresses are validated, trimmed, and lowercased. Passwords must contain
+12–128 characters and are stored as salted scrypt hashes, not plaintext.
+
+Before deploying authentication, generate a session signing secret:
+
+```bash
+openssl rand -hex 32
+```
+
+Put the generated value in `SESSION_SECRET` in the server's private `.env`.
+Generate a separate value for local development. Never commit these values or
+paste them into logs. Changing the secret invalidates existing signed cookies.
+`CORS_ORIGINS` defaults to `https://mingocell.dcism.org,http://localhost:3000`;
+use exact origins without trailing slashes. Do not set a wildcard.
+
+Run account commands **on the server**, from the backend directory after migrations:
+
+```bash
+npm run account -- create expert@example.org pathologist
+npm run account -- create admin@example.org admin
+npm run account -- reset-password expert@example.org
+npm run account -- deactivate expert@example.org
+```
+
+Passwords are entered twice through a hidden terminal prompt, never supplied as
+command-line arguments. School SSH access and database credentials authorize
+these tools; a browser admin session does not expose account administration.
+`admin` does not grant expert-review permission. Resetting passwords or
+deactivating accounts revokes all their sessions; resetting a disabled account
+does not reactivate it.
+
+Migrations run transactionally with a database lock and checksum tracking. Run
+`npm run build && npm run migrate` locally before starting. CI/CD runs migrations
+automatically on production before restarting PM2. Do not edit an applied SQL
+migration; add a new numbered file for later schema changes.
+
+## Authentication API contract
+
+All browser calls must use `credentials: 'include'`. Responses are JSON except
+successful logout (204). Authentication responses use `Cache-Control: no-store`.
+
+1. **Bootstrap:** `GET /api/v1/auth/session` creates an anonymous session and
+   returns `{user: null, csrfToken, expiresAt: null, rememberMe: false}` when
+   signed out. Save the returned CSRF token in memory.
+2. **Login:** `POST /api/v1/auth/login` with JSON
+   `{email, password, rememberMe: false}`. Supply `X-CSRF-Token` from step 1;
+   browsers supply the allowed `Origin` header. `rememberMe` is optional and must
+   be boolean. Login rotates both the session ID and CSRF token.
+3. **Current session:** `GET /api/v1/auth/session` returns the same response shape
+   as login. `user` is `{id, email, role}`, or null when signed out. `expiresAt`
+   is an ISO UTC timestamp. Use the latest `csrfToken` for writes.
+4. **Logout:** `POST /api/v1/auth/logout` with current `X-CSRF-Token` and allowed
+   `Origin`. Returns 204, deletes the current session and clears its cookie.
+   Other browsers/devices remain signed in.
+
+Example login after session bootstrap:
+
+```js
+const api = 'https://api-mingocell.dcism.org';
+const sessionResponse = await fetch(`${api}/api/v1/auth/session`, {
+  credentials: 'include',
+});
+if (!sessionResponse.ok) throw new Error('Session unavailable');
+const session = await sessionResponse.json();
+
+const loginResponse = await fetch(`${api}/api/v1/auth/login`, {
+  method: 'POST',
+  credentials: 'include',
+  headers: {
+    'Content-Type': 'application/json',
+    'X-CSRF-Token': session.csrfToken,
+  },
+  body: JSON.stringify({ email, password, rememberMe }),
+});
+// Check loginResponse.ok, validate its response, and replace the in-memory CSRF token.
+```
+
+Normal sessions expire 8 hours after login; remembered sessions expire after
+7 days. Activity does not extend the deadline. PostgreSQL holds sessions across
+PM2 restarts. Expiry, deactivation, and password-version changes are enforced
+server-side. Cookies are host-only, HttpOnly, SameSite=Lax and Secure in
+production (`__Host-mingocell.sid`). Local development uses `mingocell.sid`
+without Secure; use the local frontend with the local API, not the production
+API, because SameSite cookies do not work across unrelated sites.
+
+Apache must forward HTTPS as `X-Forwarded-Proto: https` and overwrite incoming
+forwarding headers. Express trusts loopback proxies only. Existing school HTTPS
+reverse proxy is expected to connect over loopback.
+
+Errors use `{error: {code, message}}`: invalid input/JSON (400), invalid
+credentials or missing/expired authentication (401), rejected origin/CSRF or
+role (403), oversized JSON body (413), and throttling (429). Invalid passwords,
+unknown emails, and disabled accounts share the same generic login error.
+Login is limited to 10 attempts per 15 minutes per IP and per normalized email;
+API requests are limited to 120 per 15 minutes per IP. Throttles are in-process
+for the current single PM2 instance; use a shared store before adding replicas.
+Request IDs are returned in `X-Request-ID`; passwords, cookies, and CSRF tokens
+must not be logged. No frontend login wiring is included in this backend change.
+
+## Authentication checks
+
+`npm test` runs HTTP and password/role tests without school credentials.
+Database integration tests also run when `TEST_DATABASE_URL` targets an isolated
+database named **mingocell_test**; they never read local `.env` or reuse `DB_*`.
+
+```bash
+TEST_DATABASE_URL=postgresql://USER:PASSWORD@127.0.0.1:PORT/mingocell_test npm test
+```
+
+Integration checks cover migration repeatability, duplicate emails, CSRF,
+session rotation/persistence, cookie flags, fixed expiry, current-browser logout,
+password reset/deactivation, error redaction, and throttling. GitHub Actions
+provisions disposable PostgreSQL 16 and runs all checks before deployment.
+CI also runs `python3 tests/account-cli.py` with the same test database to verify
+that passwords never echo in the account command's terminal prompts. This
+check uses Python's standard library; Python is not needed to run the API.
