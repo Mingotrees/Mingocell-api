@@ -1,5 +1,8 @@
-import { app } from "./app.js";
+import { time } from "node:console";
+import { createApp } from "./app.js";
+import { pool } from "./db.js";
 
+const app = createApp(() => pool.query("SELECT 1"));
 const port = Number(process.env.PORT ?? 20282);
 const host = process.env.HOST ?? "127.0.0.1";
 
@@ -18,10 +21,21 @@ server.on("error", (error) => {
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
-    server.close((error) => {
-      if (error) console.error(error);
-      process.exit(error ? 1 : 0);
+    const timeout = setTimeout(() => process.exit(1), 10_000);
+    timeout.unref();
+
+    server.close(async (error) => {
+      let exitCode = error ? 1 : 0;
+
+      try {
+        await pool.end();
+      } catch {
+        console.error("Failed to close PostgresSQL connections.");
+        exitCode = 1;
+      }
+
+      clearTimeout(timeout);
+      process.exit(exitCode);
     });
-    setTimeout(() => process.exit(1), 10_000).unref();
   });
 }
