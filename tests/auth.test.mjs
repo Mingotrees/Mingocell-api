@@ -45,25 +45,28 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   assert.equal(url.pathname, "/mingocell_test", "Integration tests require isolated mingocell_test database");
   const pool = new pg.Pool({ connectionString: url.toString(), max: 5, connectionTimeoutMillis: 5000 });
   t.after(() => pool.end());
-  // Reproduce production state: migration 001 was already applied before the
-  // maintainer role was renamed. Migration 002 must preserve checksum history.
+  // Reproduce production state: migration 001 is already recorded with its
+  // deployed checksum, so only 002 may run.
   const firstSql = await readFile(new URL("../migrations/001_auth.sql", import.meta.url), "utf8");
   const firstChecksum = createHash("sha256").update(firstSql).digest("hex");
+  assert.equal(firstChecksum, "e30a8ff9581408593ed715bb3f2bb9bc7740f77001137c284db95dc95d80b6ea");
   await pool.query(`CREATE TABLE public.mingocell_migrations (
     name text PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now()
   )`);
   await pool.query(firstSql);
   await pool.query("INSERT INTO public.mingocell_migrations (name, checksum) VALUES ($1, $2)",
     ["001_auth.sql", firstChecksum]);
-  const legacyUser = randomUUID();
+  const existingUser = randomUUID();
   await pool.query(`INSERT INTO mingocell_auth.users (id, email, password_hash, role)
-    VALUES ($1, $2, 'legacy-test-hash', 'maintainer')`, [legacyUser, `${legacyUser}@example.org`]);
+    VALUES ($1, $2, 'deployed-test-hash', 'admin')`, [existingUser, `${existingUser}@example.org`]);
   await migrate(pool);
   await migrate(pool); // Re-running migrations must preserve existing schema/data.
   const migrations = await pool.query("SELECT count(*)::int AS count FROM public.mingocell_migrations");
   assert.equal(migrations.rows[0].count, 2);
-  const migratedUser = await pool.query("SELECT role FROM mingocell_auth.users WHERE id = $1", [legacyUser]);
-  assert.equal(migratedUser.rows[0].role, "admin");
+  const keptUser = await pool.query("SELECT role FROM mingocell_auth.users WHERE id = $1", [existingUser]);
+  assert.equal(keptUser.rows[0].role, "admin");
+  await assert.rejects(pool.query("UPDATE mingocell_auth.users SET role = 'maintainer' WHERE id = $1",
+    [existingUser]), /users_role_check/);
 
   const origin = "http://localhost:3000";
   const secret = "isolated-test-session-secret-32-characters";

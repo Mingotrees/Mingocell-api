@@ -178,8 +178,8 @@ Migrations run transactionally with a database lock and checksum tracking. Run
 `npm run build && npm run migrate` locally before starting. CI/CD runs migrations
 automatically on production before restarting PM2. Do not edit an applied SQL
 migration; add a new numbered file for later schema changes.
-Migration `002_rename_maintainer_to_admin.sql` preserves the checksum of the
-already-deployed first migration while converting its original role name.
+Migration `002_rename_maintainer_to_admin.sql` reasserts the role constraint
+after the already-deployed first migration; the runner skips unchanged files.
 
 ## Authentication API contract
 
