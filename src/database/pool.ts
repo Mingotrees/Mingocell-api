@@ -1,4 +1,5 @@
 import { Pool } from "pg";
+import { logger } from "../logging.js";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -28,5 +29,5 @@ export const pool = new Pool({
 });
 
 pool.on("error", () => {
-  console.error("Unexpected error on idle PostgresSQL connection.");
+  logger("error", "database.idle_connection.failed");
 });

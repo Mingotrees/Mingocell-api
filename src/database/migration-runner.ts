@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import type { Pool } from "pg";
 import { withTransaction } from "./transaction.js";
+import { logger } from "../logging.js";
 
 const MIGRATION_FILE = /^\d+_[a-z0-9_]+\.sql$/;
 const MIGRATIONS_DIRECTORY = new URL("../../migrations/", import.meta.url);
@@ -25,7 +26,7 @@ async function applyPending(client: import("pg").PoolClient) {
 
     await client.query(sql);
     await client.query("INSERT INTO public.mingocell_migrations (name, checksum) VALUES ($1, $2)", [file, checksum]);
-    console.log(`Applied migration ${file}`);
+    logger("info", "database.migration.applied", { migration: file });
   }
 }
 

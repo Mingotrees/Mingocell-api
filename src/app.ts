@@ -2,12 +2,13 @@ import { randomUUID } from "node:crypto";
 import express, { type ErrorRequestHandler, type NextFunction, type Request, type RequestHandler, type Response } from "express";
 import cors from "cors";
 import helmet from "helmet";
-import { HttpError, type AuthOptions } from "./auth/middleware.js";
+import { HttpError, type AuthOptions, type PublicUser } from "./auth/middleware.js";
 import { mountAuth } from "./auth/routes.js";
+import { logger as defaultLogger, safeErrorType, type Logger, type LogFields } from "./logging.js";
 
 const LOOPBACK_ADDRESSES = ["127.0.0.1", "::1", "::ffff:127.0.0.1"];
 
-export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOptions) {
+export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOptions, log: Logger = defaultLogger) {
   const app = express();
 
   app.disable("x-powered-by");
@@ -15,6 +16,7 @@ export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOpti
   if (auth?.trustLocalHttpsProxy) app.use(markLoopbackHttps);
   app.use(helmet());
   app.use(attachRequestId);
+  app.use(logRequests(log));
 
   if (auth) {
     app.use(allowOrigins(auth.origins));
@@ -34,6 +36,7 @@ export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOpti
       await checkDatabase();
       res.json({ status: "ready" });
     } catch {
+      log("error", "database.readiness.failed", { requestId: res.locals.requestId });
       res.status(503).json({
         status: "unavailable",
         error: {
@@ -52,7 +55,7 @@ export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOpti
     });
   });
 
-  app.use(reportError);
+  app.use(reportErrors(log));
 
   return app;
 }
@@ -73,6 +76,38 @@ function attachRequestId(_req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+function logRequests(log: Logger): RequestHandler {
+  return (req, res, next) => {
+    const startedAt = process.hrtime.bigint();
+    let recorded = false;
+
+    const record = (event: "http.request.completed" | "http.request.aborted") => {
+      if (recorded) return;
+      recorded = true;
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      const user = res.locals.user as PublicUser | undefined;
+      const fields: Record<string, string | number> = {
+        requestId: res.locals.requestId,
+        method: req.method,
+        route: typeof req.route?.path === "string" ? req.route.path : "unmatched",
+        status: res.statusCode,
+        durationMs: Math.round(durationMs * 1000) / 1000,
+      };
+      if (user) {
+        fields.actorId = user.id;
+        fields.actorRole = user.role;
+      }
+      log(event === "http.request.completed" ? "info" : "warn", event, fields);
+    };
+
+    res.once("finish", () => record("http.request.completed"));
+    res.once("close", () => {
+      if (!res.writableFinished) record("http.request.aborted");
+    });
+    next();
+  };
+}
+
 function allowOrigins(origins: string[]): RequestHandler {
   return (req, _res, next) => {
     const origin = req.get("Origin");
@@ -83,16 +118,24 @@ function allowOrigins(origins: string[]): RequestHandler {
   };
 }
 
-const reportError: ErrorRequestHandler = (error, _req, res, next) => {
-  if (res.headersSent) return next(error);
-  if (error instanceof HttpError) {
-    res.status(error.status).json({ error: { code: error.code, message: error.message } });
-  } else if (error.type === "entity.too.large") {
-    res.status(413).json({ error: { code: "BODY_TOO_LARGE", message: "Request body is too large." } });
-  } else if (error.type === "entity.parse.failed") {
-    res.status(400).json({ error: { code: "INVALID_JSON", message: "Provide valid JSON." } });
-  } else {
-    console.error("Request failed", { requestId: res.locals.requestId });
-    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Request could not be completed." } });
-  }
-};
+function reportErrors(log: Logger): ErrorRequestHandler {
+  return (error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    if (error instanceof HttpError) {
+      res.status(error.status).json({ error: { code: error.code, message: error.message } });
+    } else if (error.type === "entity.too.large") {
+      res.status(413).json({ error: { code: "BODY_TOO_LARGE", message: "Request body is too large." } });
+    } else if (error.type === "entity.parse.failed") {
+      res.status(400).json({ error: { code: "INVALID_JSON", message: "Provide valid JSON." } });
+    } else {
+      const fields: LogFields = {
+        requestId: res.locals.requestId,
+        method: req.method,
+        route: typeof req.route?.path === "string" ? req.route.path : "unmatched",
+        errorType: safeErrorType(error),
+      };
+      log("error", "http.request.failed", fields);
+      res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Request could not be completed." } });
+    }
+  };
+}

@@ -5,6 +5,7 @@ import session from "express-session";
 import connectPgSimple from "connect-pg-simple";
 import rateLimit from "express-rate-limit";
 import type { Pool } from "pg";
+import { logger as defaultLogger, type Logger } from "../logging.js";
 
 export type Role = "pathologist" | "admin";
 export type User = { id: string; email: string; role: Role; active: boolean; auth_version: number };
@@ -37,7 +38,7 @@ export class HttpError extends Error {
   constructor(public status: number, public code: string, message: string) { super(message); }
 }
 
-export function createSessionStore(pool: Pool) {
+export function createSessionStore(pool: Pool, log: Logger = defaultLogger) {
   const Store = connectPgSimple(session);
   return new Store({
     pool,
@@ -45,7 +46,7 @@ export function createSessionStore(pool: Pool) {
     tableName: "sessions",
     disableTouch: true,
     pruneSessionInterval: 900,
-    errorLog: () => console.error("PostgreSQL session storage operation failed."),
+    errorLog: () => log("error", "session.store.failed"),
   });
 }
 

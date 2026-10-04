@@ -70,11 +70,13 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
 
   const origin = "http://localhost:3000";
   const secret = "isolated-test-session-secret-32-characters";
+  const requestLogs = [];
+  const captureLogger = (level, event, fields = {}) => requestLogs.push({ level, event, ...fields });
   async function start({ secureCookies = false, trustLocalHttpsProxy = false } = {}) {
     const store = createSessionStore(pool);
     const app = createApp(() => pool.query("SELECT 1"), {
       pool, store, secret, secureCookies, trustLocalHttpsProxy, origins: [origin],
-    });
+    }, captureLogger);
     const server = app.listen(0, "127.0.0.1");
     t.after(async () => {
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -159,6 +161,9 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
     assert.equal(login.data.user.role, "pathologist");
     assert.equal(login.data.user.email, email);
     assert.equal(login.data.user.password_hash, undefined);
+    assert.ok(requestLogs.some((entry) => entry.event === "http.request.completed"
+      && entry.route === "/api/v1/auth/login" && entry.status === 200
+      && entry.actorId === login.data.user.id && entry.actorRole === "pathologist"));
     assert.notEqual(normal.cookie, oldCookie);
     assert.notEqual(normal.csrf, oldToken);
     assert.ok(Math.abs(Date.parse(login.data.expiresAt) - startTime - 8 * 3600_000) < 5000);

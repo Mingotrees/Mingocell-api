@@ -91,7 +91,9 @@ function loginHandler(options: AuthOptions): RequestHandler {
     req.session.cookie.maxAge = duration;
     await promisify(req.session.save.bind(req.session))();
 
-    res.json(sessionPayload(req, { id: user.id, email: user.email, role: user.role }));
+    const publicUser = { id: user.id, email: user.email, role: user.role } satisfies PublicUser;
+    res.locals.user = publicUser;
+    res.json(sessionPayload(req, publicUser));
   };
 }
 

@@ -3,8 +3,10 @@ import { once } from "node:events";
 import test from "node:test";
 import { createApp } from "../dist/app.js";
 
+const noOpLogger = () => {};
+
 test("health and unknown routes return documented JSON", async (t) => {
-  const app = createApp(async () => ({ rows: [{ value: 1 }] }));
+  const app = createApp(async () => ({ rows: [{ value: 1 }] }), undefined, noOpLogger);
   const server = app.listen(0, "127.0.0.1");
   t.after(
     () =>
@@ -37,7 +39,7 @@ test("health and unknown routes return documented JSON", async (t) => {
 test("database failure returns 503 while liveness stays healthy", async (t) => {
   const app = createApp(async () => {
     throw new Error("Internal database details must not reach client");
-  });
+  }, undefined, noOpLogger);
 
   const server = app.listen(0, "127.0.0.1");
 

@@ -8,6 +8,7 @@ Express 5 + TypeScript. Requires Node.js 24 or newer.
 src/
 ├── app.ts                       Express app, global middleware, health checks, errors
 ├── server.ts                    HTTP startup and graceful shutdown
+├── logging.ts                   Audit-safe structured operational logging
 ├── database/
 │   ├── pool.ts                  PostgreSQL connection pool
 │   └── migration-runner.ts      Transactional SQL migration runner
@@ -88,6 +89,37 @@ pm2 delete mingocell-api
 
 Follow DCISM's instructions for reboot persistence. `pm2 save` saves the process
 list but does not itself install a boot service.
+
+## Structured operational logs
+
+The API writes one JSON object per line so PM2 can retain searchable,
+request-correlated operational events. Inspect them on the server with:
+
+```bash
+pm2 logs mingocell-api
+pm2 logs mingocell-api --err
+```
+
+Every entry contains `timestamp`, `service`, `level`, and `event`. Completed HTTP
+requests also include the server-generated `requestId`, method, matched route
+template, status, duration in milliseconds, and authenticated actor UUID/role
+when available. Use that request ID with the response's `X-Request-ID` header to
+trace a reported failure.
+
+```json
+{"timestamp":"2026-10-04T09:30:00.000Z","service":"mingocell-api","level":"info","event":"http.request.completed","requestId":"fe9a54e6-98df-43c7-930c-60caddc5890d","method":"GET","route":"/health/live","status":200,"durationMs":1.274}
+```
+
+Logs use matched route templates rather than raw URLs and never intentionally
+include query values, request bodies, headers, IP addresses, emails, passwords,
+cookies, authorization values, CSRF tokens, filenames, image data, or review
+notes. Unexpected errors record only a safe error type and request context, not
+the exception message. Error events go to stderr; info and warning events go to
+stdout.
+
+These logs support deployment and incident troubleshooting. They are not the
+append-only prediction/review audit history required by the product workflow;
+that history must be persisted separately with the future record endpoints.
 
 ## GitHub Actions CI/CD
 
