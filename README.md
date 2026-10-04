@@ -174,7 +174,7 @@ openssl rand -hex 32
 Put the generated value in `SESSION_SECRET` in the server's private `.env`.
 Generate a separate value for local development. Never commit these values or
 paste them into logs. Changing the secret invalidates existing signed cookies.
-`CORS_ORIGINS` defaults to `https://mingocell.dcism.org,http://localhost:3000`;
+`CORS_ORIGINS` defaults to `https://mingocells.dcism.org,http://localhost:3000`;
 use exact origins without trailing slashes. Do not set a wildcard.
 
 DCISM Apache terminates HTTPS on the same server but does not forward the

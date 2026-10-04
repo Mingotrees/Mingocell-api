@@ -127,7 +127,7 @@ function readBooleanFlag(name: string) {
 }
 
 function readOrigins(value: string | undefined) {
-  const origins = (value ?? "https://mingocell.dcism.org,http://localhost:3000")
+  const origins = (value ?? "https://mingocells.dcism.org,http://localhost:3000")
     .split(",").map((origin) => origin.trim());
   for (const origin of origins) {
     const url = new URL(origin);

@@ -9,7 +9,7 @@
 | Last verified | 2026-10-04 |
 | Backend commit | `2eeb6ba` |
 | Production API | `https://api-mingocell.dcism.org` |
-| Production frontend | `https://mingocell.dcism.org` |
+| Production frontend | `https://mingocells.dcism.org` |
 
 If this document conflicts with backend behavior, tests and source code are the
 source of truth. Report the drift and update this file with the backend change.
@@ -385,7 +385,7 @@ browser cannot currently depend on rate-limit response headers.
 Default allowed origins:
 
 ```text
-https://mingocell.dcism.org
+https://mingocells.dcism.org
 http://localhost:3000
 ```
 
