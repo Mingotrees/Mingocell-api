@@ -6,8 +6,8 @@
 | Field | Value |
 | --- | --- |
 | Contract status | Current implementation plus explicit gaps |
-| Last verified | 2026-10-04 |
-| Backend commit | `2eeb6ba` |
+| Last verified | 2026-10-05 |
+| Backend commit | Pending commit, based on `85f545b` |
 | Production API | `https://api-mingocell.dcism.org` |
 | Production frontend | `https://mingocells.dcism.org` |
 
@@ -18,7 +18,7 @@ source of truth. Report the drift and update this file with the backend change.
 
 | Capability | Status | Notes |
 | --- | --- | --- |
-| Liveness and database readiness | **Available** | Public health endpoints |
+| Liveness and database/storage readiness | **Available** | Public health endpoints |
 | Session bootstrap and restoration | **Available** | PostgreSQL-backed cookie session |
 | Email/password login | **Available** | Accounts are provisioned by an administrator |
 | Logout | **Available** | Ends only the current browser session |
@@ -26,15 +26,17 @@ source of truth. Report the drift and update this file with the backend change.
 | Public signup | **Unavailable** | No signup endpoint |
 | Browser password reset | **Unavailable** | Server CLI only |
 | Browser account administration | **Unavailable** | Server CLI only, including for `admin` users |
-| Image/file upload | **Unavailable** | No multipart or storage API |
+| Image/file upload | **Available** | Private PNG, JPEG, and TIFF intake |
 | Predictions/inference | **Unavailable** | No model endpoint or inference readiness check |
-| Submission/history/detail views | **Unavailable** | No records or endpoints |
+| Submission detail and image access | **Available** | Owner-scoped detail, original, and preview endpoints |
+| Submission history | **Unavailable** | No list or filter endpoint |
 | Expert review | **Unavailable** | Role guard exists, but no review endpoint |
 | Realtime updates | **Unavailable** | No WebSocket, SSE, or event contract |
 
-The frontend can currently implement health display and authentication. Product
-screens for unavailable capabilities need mocked local data or an explicit
-backend contract before integration.
+The frontend can currently implement health display, authentication, image
+upload, and immediate submission detail. Product screens for unavailable
+capabilities need mocked local data or an explicit backend contract before
+integration.
 
 ## Environments
 
@@ -81,7 +83,7 @@ cookie is designed for the deployed HTTPS sites, not cross-site local requests.
 
 ## Shared Types
 
-These are the complete browser-visible authentication types today:
+These are the browser-visible authentication and image-intake types today:
 
 ```ts
 export type Role = "pathologist" | "admin";
@@ -97,6 +99,26 @@ export type SessionResponse = {
   csrfToken: string; // 64 lowercase hexadecimal characters
   expiresAt: string | null; // ISO 8601 UTC
   rememberMe: boolean;
+};
+
+export type UploadResponse = {
+  image: {
+    id: string;
+    format: "jpeg" | "png" | "tiff";
+    byteSize: number;
+    pageCount: number;
+    sha256: string;
+    uploadedAt: string;
+  };
+  submissions: Array<{
+    id: string;
+    pageIndex: number;
+    width: number;
+    height: number;
+    status: "uploaded";
+    imageUrl: string;
+    previewUrl: string;
+  }>;
 };
 
 export type ApiErrorResponse = {
@@ -116,10 +138,27 @@ export type ReadyResponse =
   | {
       status: "unavailable";
       error: {
-        code: "DATABASE_UNAVAILABLE";
+        code: "DATABASE_UNAVAILABLE" | "STORAGE_UNAVAILABLE";
         message: string;
       };
     };
+
+export type SubmissionResponse = {
+  id: string;
+  pageIndex: number;
+  width: number;
+  height: number;
+  status: "uploaded" | "analyzed" | "failed";
+  createdAt: string;
+  source: {
+    format: "jpeg" | "png" | "tiff";
+    byteSize: number;
+    sha256: string;
+    pageCount: number;
+  };
+  imageUrl: string;
+  previewUrl: string;
+};
 ```
 
 Do not depend on internal fields such as `active`, `auth_version`, password
@@ -166,13 +205,14 @@ current browser session.
 
 ## Endpoint Catalog
 
-There are no query parameters or path parameters in the current API.
+Submission read endpoints use a UUID path parameter. There are no query
+parameters in the current API.
 
 ### `GET /health/live`
 
 Checks whether the API process can answer HTTP requests. No authentication or
-session is required. This does not check PostgreSQL or future model/storage
-dependencies.
+session is required. This does not check PostgreSQL, image storage, or future
+inference dependencies.
 
 Response `200`:
 
@@ -185,8 +225,11 @@ Response `200`:
 
 ### `GET /health/ready`
 
-Checks PostgreSQL connectivity with `SELECT 1`. No authentication or session is
-required. This does not check migrations, inference, or storage.
+Checks PostgreSQL connectivity with `SELECT 1`, validates all private storage
+directories, performs a temporary write/remove probe, and verifies enough free
+space remains for the configured reserve plus one worst-case upload. No
+authentication or session is required. This does not check migrations or
+inference.
 
 Response `200`:
 
@@ -207,6 +250,10 @@ Response `503`:
   }
 }
 ```
+
+The error code is `DATABASE_UNAVAILABLE` when PostgreSQL fails, or
+`STORAGE_UNAVAILABLE` with message `Image storage unavailable.` when a storage
+directory cannot be read or written.
 
 ### `GET /api/v1/auth/session`
 
@@ -321,6 +368,124 @@ CSRF validation runs before the logout route's authentication guard. An
 anonymous request with a missing or invalid CSRF token therefore returns `403`;
 an anonymous request with a valid anonymous token returns `401`.
 
+### `POST /api/v1/submissions`
+
+Stores one private source file and creates one `uploaded` submission per image
+page. Requires an authenticated session, allowed origin, current CSRF token, and
+an idempotency key.
+
+Headers and body:
+
+```http
+Content-Type: multipart/form-data; boundary=<browser-generated>
+X-CSRF-Token: <token from latest session response>
+Idempotency-Key: <8-128 safe characters; UUID recommended>
+```
+
+The multipart body must contain exactly one file field named `image` and no text
+fields. Let `fetch` set the multipart `Content-Type`; manually setting it omits
+the boundary and breaks parsing.
+
+Accepted input:
+
+- PNG, JPEG, or TIFF, detected from decoded bytes rather than filename/MIME type.
+- At most 5,242,880 bytes (5 MiB).
+- At most 4,000,000 pixels per page and 20,000,000 pixels across the file.
+- At most 20 TIFF pages. PNG/JPEG must be single-page.
+- Every TIFF page must represent an independent cell image. Each page creates a
+  separate submission with a zero-based `pageIndex`.
+- The complete pixel payload is decoded before success. Corrupt later TIFF pages
+  fail the whole upload.
+- The complete HTTP request body must arrive within 60 seconds.
+
+Success `201`:
+
+```json
+{
+  "image": {
+    "id": "0aa26902-2192-4fdf-8d34-d31993a66f02",
+    "format": "tiff",
+    "byteSize": 243118,
+    "pageCount": 1,
+    "sha256": "64-lowercase-hex-characters",
+    "uploadedAt": "2026-10-05T03:52:26.000Z"
+  },
+  "submissions": [
+    {
+      "id": "488b9de8-470d-460b-82f2-0106aff5bc26",
+      "pageIndex": 0,
+      "width": 288,
+      "height": 288,
+      "status": "uploaded",
+      "imageUrl": "/api/v1/submissions/488b9de8-470d-460b-82f2-0106aff5bc26/image",
+      "previewUrl": "/api/v1/submissions/488b9de8-470d-460b-82f2-0106aff5bc26/preview"
+    }
+  ]
+}
+```
+
+`uploaded` means persisted, not analyzed. No model output exists. Originals stay
+unchanged; previews are JPEG derivatives. Preprocessed model inputs are not
+stored.
+
+If delivery fails, retry the same bytes with the same idempotency key. A completed
+retry returns the original `201` body and `Idempotency-Replayed: true`. Reusing
+the key with different bytes returns `409 IDEMPOTENCY_CONFLICT`. Generate a new
+key for a deliberate second submission of the same image.
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `400` | `IMAGE_REQUIRED` | Missing `image` file field |
+| `400` | `INVALID_MULTIPART` | Extra file/field, malformed multipart, or wrong field name |
+| `400` | `IDEMPOTENCY_KEY_INVALID` | Missing or malformed idempotency key |
+| `400` | `INVALID_IMAGE` | Empty, corrupt, or undecodable image |
+| `401` | `UNAUTHENTICATED` | No current authenticated user |
+| `403` | `CSRF_INVALID`, `ORIGIN_FORBIDDEN` | Browser security validation failed |
+| `409` | `IDEMPOTENCY_CONFLICT` | Key was used for different bytes |
+| `413` | `IMAGE_TOO_LARGE` | File exceeds 5 MiB |
+| `413` | `IMAGE_TOO_MANY_PIXELS` | Per-page or aggregate pixel limit exceeded |
+| `413` | `TOO_MANY_PAGES` | TIFF exceeds 20 pages |
+| `415` | `UNSUPPORTED_IMAGE_FORMAT` | Content is not supported PNG/JPEG/TIFF |
+| `429` | `RATE_LIMITED` | General or upload-specific limit reached |
+| `429` | `UPLOAD_BUSY` | This owner or process already has maximum in-flight uploads |
+| `500` | `INTERNAL_ERROR` | Persistence or processing failed |
+| `507` | `STORAGE_QUOTA_EXCEEDED`, `STORAGE_CAPACITY_LOW` | Owner quota or server free-space reserve reached |
+
+### `GET /api/v1/submissions/:id`
+
+Returns persisted metadata for a submission owned by the authenticated user.
+Another user's ID and an unknown/malformed ID both return
+`404 SUBMISSION_NOT_FOUND`; this avoids revealing record existence. Success uses
+`SubmissionResponse` from Shared Types.
+
+### `GET /api/v1/submissions/:id/image`
+
+Streams the immutable original source file as an attachment. For a page from a
+multi-page TIFF, this returns the complete original TIFF; `pageIndex` identifies
+the submission's page. Requires ownership. Response includes the detected image
+MIME type, `Content-Length`, attachment disposition, and
+`X-Content-Type-Options: nosniff`.
+
+### `GET /api/v1/submissions/:id/preview`
+
+Streams the submission page's JPEG preview inline. Requires ownership. The
+preview is for browser display only; future inference must use the original page.
+`imageUrl` and `previewUrl` are API-relative paths. Resolve them against
+`NEXT_PUBLIC_API_URL`, not the frontend origin:
+
+```ts
+const previewSrc = new URL(submission.previewUrl, API_URL).toString();
+```
+
+Image responses override Helmet's resource policy with
+`Cross-Origin-Resource-Policy: same-site`, matching the production frontend/API
+subdomains. Requests still need the session cookie.
+
+All three read endpoints may return `401 UNAUTHENTICATED`,
+`404 SUBMISSION_NOT_FOUND`, `429 RATE_LIMITED`, or `500 INTERNAL_ERROR`. Image
+and preview retrieval can also return `503 STORAGE_UNAVAILABLE` when a referenced
+file is missing or unreadable.
+
 ### Unknown routes and methods
 
 Unknown routes return `404`:
@@ -355,25 +520,29 @@ assume every error body contains only the `error` property.
 
 | Status | Common codes |
 | --- | --- |
-| `400` | `INVALID_INPUT`, `INVALID_JSON` |
+| `400` | `INVALID_INPUT`, `INVALID_JSON`, `INVALID_MULTIPART`, `INVALID_IMAGE`, `IMAGE_REQUIRED`, `IDEMPOTENCY_KEY_INVALID` |
 | `401` | `INVALID_CREDENTIALS`, `UNAUTHENTICATED` |
 | `403` | `CSRF_INVALID`, `ORIGIN_FORBIDDEN`, `FORBIDDEN`, `PROXY_FORBIDDEN` |
-| `404` | `NOT_FOUND` |
-| `413` | `BODY_TOO_LARGE` |
-| `429` | `RATE_LIMITED` |
+| `404` | `NOT_FOUND`, `SUBMISSION_NOT_FOUND` |
+| `409` | `IDEMPOTENCY_CONFLICT` |
+| `413` | `BODY_TOO_LARGE`, `IMAGE_TOO_LARGE`, `IMAGE_TOO_MANY_PIXELS`, `TOO_MANY_PAGES` |
+| `415` | `UNSUPPORTED_IMAGE_FORMAT` |
+| `429` | `RATE_LIMITED`, `UPLOAD_BUSY` |
 | `500` | `INTERNAL_ERROR` |
-| `503` | `DATABASE_UNAVAILABLE` |
+| `503` | `DATABASE_UNAVAILABLE`, `STORAGE_UNAVAILABLE` |
+| `507` | `STORAGE_QUOTA_EXCEEDED`, `STORAGE_CAPACITY_LOW` |
 
-Every response receives an `X-Request-ID` UUID. The current CORS configuration
-does not expose that header, so cross-origin browser JavaScript cannot reliably
-read it. Rate-limit headers have the same limitation. Do not make UI behavior
-depend on either header until the backend explicitly exposes them.
+Every response receives an exposed `X-Request-ID` UUID. Upload replays expose
+`Idempotency-Replayed`. Rate-limit headers are not part of the frontend contract;
+use the `429` error body for UI behavior.
 
 ### Rate limits
 
 - Every `/api/v1/*` request: 120 requests per 15 minutes per IP.
 - Login: an additional 10 requests per 15 minutes per IP.
 - Login: another 10 requests per 15 minutes per normalized email hash.
+- Upload: an additional 20 requests per 15 minutes per IP.
+- Upload decoding: at most two concurrent uploads per API process and one per owner.
 - Successful login requests count toward these limits.
 - Counters are in memory, reset on restart, and are not shared across replicas.
 
@@ -394,7 +563,10 @@ CORS behavior:
 - Exact origins only, with no trailing slash.
 - Credentialed requests are enabled.
 - Allowed methods are `GET`, `POST`, and `OPTIONS`.
-- Allowed non-safelisted request headers are `Content-Type` and `X-CSRF-Token`.
+- Allowed non-safelisted request headers are `Content-Type`, `X-CSRF-Token`, and
+  `Idempotency-Key`.
+- Browser-readable response headers include `X-Request-ID` and
+  `Idempotency-Replayed`.
 - `Authorization` is neither allowed nor used.
 - Explicit disallowed origins are rejected globally, including health requests.
 - Because origin rejection occurs before CORS headers are added, browsers may
@@ -424,6 +596,26 @@ export type SessionResponse = {
   csrfToken: string;
   expiresAt: string | null;
   rememberMe: boolean;
+};
+
+export type UploadResponse = {
+  image: {
+    id: string;
+    format: "jpeg" | "png" | "tiff";
+    byteSize: number;
+    pageCount: number;
+    sha256: string;
+    uploadedAt: string;
+  };
+  submissions: Array<{
+    id: string;
+    pageIndex: number;
+    width: number;
+    height: number;
+    status: "uploaded";
+    imageUrl: string;
+    previewUrl: string;
+  }>;
 };
 
 type ApiErrorResponse = {
@@ -458,7 +650,9 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
-  if (init.body !== undefined) headers.set("Content-Type", "application/json");
+  if (init.body !== undefined && !(init.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
   if (!safe && csrfToken) headers.set("X-CSRF-Token", csrfToken);
 
   const response = await fetch(`${API_URL}${path}`, {
@@ -508,12 +702,23 @@ export async function logout(): Promise<void> {
   await apiRequest<void>("/api/v1/auth/logout", { method: "POST" });
   csrfToken = null;
 }
+
+export async function uploadImage(file: File, idempotencyKey: string): Promise<UploadResponse> {
+  const form = new FormData();
+  form.set("image", file);
+  return apiRequest<UploadResponse>("/api/v1/submissions", {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body: form,
+  });
+}
 ```
 
 This minimal wrapper assumes backend JSON for non-`204` responses. A production
 frontend may add runtime schema validation and a dedicated network/CORS error
 type. It must preserve credentials, CSRF replacement after login, and no unsafe
-automatic retries.
+automatic retries. Generate one idempotency key with `crypto.randomUUID()` per
+deliberate upload and retain it until that upload succeeds or is abandoned.
 
 ## Authorization
 
@@ -523,11 +728,14 @@ automatic retries.
 | Read session | Allowed | Allowed | Allowed |
 | Login | Allowed | Allowed | Allowed |
 | Logout | Denied | Allowed | Allowed |
+| Upload image | Denied | Own records | Own records |
+| Read submission/original/preview | Denied | Own records | Own records |
 | Pathologist-only future route | Denied | Allowed | Denied |
 
 Roles are exact, not hierarchical. `admin` does not inherit `pathologist`
-permission. No currently exposed product endpoint uses a role guard, so do not
-infer additional role capabilities.
+permission. Image access is based on ownership rather than role; administrators
+cannot read another user's images. No currently exposed product endpoint uses a
+role guard, so do not infer additional role capabilities.
 
 ## Frontend Agent Checklist
 
@@ -541,8 +749,13 @@ infer additional role capabilities.
 - Do not parse a successful logout as JSON.
 - Handle network/CORS failures separately from JSON API errors.
 - Route `401 UNAUTHENTICATED` to a fresh bootstrap and login; do not retry writes.
-- Do not show signup, reset-password, upload, prediction, history, or review as
-  connected features until backend endpoints exist.
+- Generate and retain one idempotency UUID for each deliberate upload. Reuse it
+  only when retrying that same file.
+- Treat every returned TIFF page as its own submission and keep `pageIndex`.
+- Resolve `imageUrl` and `previewUrl` against `NEXT_PUBLIC_API_URL`. Use the
+  preview for display; never use preview bytes as model input.
+- Do not show signup, reset-password, prediction, history, or review as connected
+  features until backend endpoints exist.
 - Never log passwords, cookies, CSRF tokens, or full authentication request bodies.
 
 ## Contract Maintenance
@@ -574,11 +787,14 @@ Primary contract sources:
 - `src/auth/routes.ts`: session, login, logout, payloads, login throttles
 - `src/auth/middleware.ts`: cookies, sessions, roles, CSRF, general throttling
 - `src/auth/passwords.ts`: email and password validation
+- `src/images/routes.ts`: upload, submission, ownership, idempotency, and file responses
+- `src/images/storage.ts`: paths, limits, readiness, and reconciliation
 - `tests/server.test.mjs`: health and not-found contract checks
-- `tests/auth.test.mjs`: browser authentication lifecycle checks
+- `tests/auth.test.mjs`: browser authentication and image-intake lifecycle checks
 
 ## Change Log
 
 | Date | Backend commit | Change |
 | --- | --- | --- |
+| 2026-10-05 | Pending | Added private image intake and owner-scoped submission/original/preview endpoints |
 | 2026-10-04 | `2eeb6ba` | Created frontend handoff for implemented health and authentication contracts |

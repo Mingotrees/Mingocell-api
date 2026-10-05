@@ -4,11 +4,18 @@ import cors from "cors";
 import helmet from "helmet";
 import { HttpError, type AuthOptions, type PublicUser } from "./auth/middleware.js";
 import { mountAuth } from "./auth/routes.js";
+import { mountImageRoutes } from "./images/routes.js";
+import { checkImageStorage, type ImageStorageOptions } from "./images/storage.js";
 import { logger as defaultLogger, safeErrorType, type Logger, type LogFields } from "./logging.js";
 
 const LOOPBACK_ADDRESSES = ["127.0.0.1", "::1", "::ffff:127.0.0.1"];
 
-export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOptions, log: Logger = defaultLogger) {
+export function createApp(
+  checkDatabase: () => Promise<unknown>,
+  auth?: AuthOptions,
+  log: Logger = defaultLogger,
+  imageStorage?: ImageStorageOptions,
+) {
   const app = express();
 
   app.disable("x-powered-by");
@@ -22,7 +29,9 @@ export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOpti
     app.use(allowOrigins(auth.origins));
     app.use(cors({
       origin: auth.origins, credentials: true,
-      methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "X-CSRF-Token"],
+      methods: ["GET", "POST", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "X-CSRF-Token", "Idempotency-Key"],
+      exposedHeaders: ["Idempotency-Replayed", "X-Request-ID"],
     }));
   }
   app.use(express.json({ limit: "16kb" }));
@@ -34,10 +43,9 @@ export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOpti
   app.get("/health/ready", async (_req, res) => {
     try {
       await checkDatabase();
-      res.json({ status: "ready" });
     } catch {
       log("error", "database.readiness.failed", { requestId: res.locals.requestId });
-      res.status(503).json({
+      return res.status(503).json({
         status: "unavailable",
         error: {
           code: "DATABASE_UNAVAILABLE",
@@ -45,9 +53,28 @@ export function createApp(checkDatabase: () => Promise<unknown>, auth?: AuthOpti
         },
       });
     }
+
+    if (imageStorage) {
+      try {
+        await checkImageStorage(imageStorage);
+      } catch {
+        log("error", "storage.readiness.failed", { requestId: res.locals.requestId });
+        return res.status(503).json({
+          status: "unavailable",
+          error: {
+            code: "STORAGE_UNAVAILABLE",
+            message: "Image storage unavailable.",
+          },
+        });
+      }
+    }
+    res.json({ status: "ready" });
   });
 
-  if (auth) mountAuth(app, auth);
+  if (auth) {
+    mountAuth(app, auth);
+    if (imageStorage) mountImageRoutes(app, imageStorage);
+  }
 
   app.use((_req, res) => {
     res.status(404).json({

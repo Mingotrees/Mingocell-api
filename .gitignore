@@ -83,7 +83,7 @@ out
 dist
 .output
 
-
+dataset/
 docs/*
 # Gatsby files
 .cache/

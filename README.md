@@ -17,6 +17,9 @@ src/
 │   ├── middleware.ts            Sessions, CSRF, account checks, role guards, configuration
 │   ├── accounts.ts              Account creation, password reset, deactivation
 │   └── passwords.ts             Email validation and password hashing/verification
+├── images/
+│   ├── routes.ts                Private upload, submission, original, and preview endpoints
+│   └── storage.ts               Storage limits, paths, readiness, and reconciliation
 └── cli/
     ├── manage-account.ts        Hidden-prompt account management command
     └── migrate-database.ts      Migration command entry point
@@ -52,9 +55,50 @@ Local school-database access requires your SSH tunnel; its host/port can differ
 from production. `npm run dev` uses development cookies for local HTTP;
 `npm start` forces production mode with secure cookies.
 
-Liveness returns `{"status":"ok","service":"mingocell-api"}`. Database readiness
-is `GET /health/ready`, returning `{"status":"ready"}` or HTTP 503.
+Liveness returns `{"status":"ok","service":"mingocell-api"}`. Database and
+image-storage readiness is `GET /health/ready`, returning `{"status":"ready"}`
+or HTTP 503.
 Inference is not connected yet.
+
+## Private image storage
+
+Authenticated users can upload one PNG, JPEG, or TIFF to
+`POST /api/v1/submissions`. Limits are 5 MiB per file, 4,000,000 pixels per page,
+20,000,000 pixels across the file, and 20 TIFF pages. Each TIFF page must be an
+independent cell image and becomes one `uploaded` submission. Uploaded does not
+mean analyzed; inference is still unavailable.
+
+Original files remain immutable. Browser previews are separate JPEG derivatives.
+Model preprocessing will read the original page during future inference and will
+not persist intermediate images or tensors.
+
+Local development defaults to the gitignored `storage/` directory. Production
+uses this private path outside the deployment and Apache document roots:
+
+```dotenv
+IMAGE_STORAGE_ROOT=/data/users/s22101440/mingocell-storage
+IMAGE_OWNER_QUOTA_BYTES=5368709120
+IMAGE_MIN_FREE_BYTES=1073741824
+```
+
+```text
+mingocell-storage/
+├── originals/                   Immutable uploaded source files
+├── previews/                    Regenerable browser previews, one per page
+└── tmp/                         Bounded upload and preview staging
+```
+
+The server creates directories with mode `0700` and files with mode `0600`.
+Only authenticated API endpoints expose owner-scoped files; database rows store
+relative storage keys and provenance, never image bytes or public filesystem
+paths. Startup reconciliation removes temporary and unreferenced files older
+than 24 hours and reports referenced files that are missing.
+
+The school-server directory is still a single copy. Configure an off-host backup
+before accepting irreplaceable images; deployment does not back it up. Original
+source files are retained without automatic expiry and default to a 5 GiB quota
+per owner. Readiness and new uploads stop before available disk falls below the
+1 GiB reserve; authentication and existing reads can still start.
 
 ## PM2
 
@@ -145,9 +189,10 @@ available in noninteractive SSH sessions. Target settings are checked against
 fixed assertions in the workflow; update both if the destination changes.
 
 Deployment uploads compiled `dist/`, SQL migrations, and the package manifests,
-installs production dependencies, runs migrations, and restarts PM2. Only obsolete files inside `dist/`
-are deleted. Server `.env` is preserved; keep private images and other persistent
-data outside `dist/`, preferably outside the deployment directory.
+installs production dependencies, runs migrations, and restarts PM2. Only
+obsolete files inside `dist/` are deleted. Server `.env` is preserved. The
+workflow creates and checks `/data/users/s22101440/mingocell-storage`; rsync does
+not touch that persistent directory.
 
 Before upload, the workflow requires a configured server `SESSION_SECRET`.
 After restart, local liveness/readiness and public HTTPS liveness/authentication

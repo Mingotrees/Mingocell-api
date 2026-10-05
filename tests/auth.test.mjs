@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import pg from "pg";
+import sharp from "sharp";
 import { createApp } from "../dist/app.js";
 import { createSessionStore, requireRole, validateProxyBinding } from "../dist/auth/middleware.js";
 import { createAccount, updateAccount } from "../dist/auth/accounts.js";
 import { migrate } from "../dist/database/migration-runner.js";
 import { hashPassword, normalizeEmail, verifyPassword } from "../dist/auth/passwords.js";
+import { imageStorageOptions, initializeImageStorage } from "../dist/images/storage.js";
 
 test("email normalization and salted password verification", async () => {
   assert.equal(normalizeEmail("  Expert@Example.org "), "expert@example.org");
@@ -46,7 +50,7 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   const pool = new pg.Pool({ connectionString: url.toString(), max: 5, connectionTimeoutMillis: 5000 });
   t.after(() => pool.end());
   // Reproduce production state: migration 001 is already recorded with its
-  // deployed checksum, so only 002 may run.
+  // deployed checksum, so later migrations may run.
   const firstSql = await readFile(new URL("../migrations/001_auth.sql", import.meta.url), "utf8");
   const firstChecksum = createHash("sha256").update(firstSql).digest("hex");
   assert.equal(firstChecksum, "e30a8ff9581408593ed715bb3f2bb9bc7740f77001137c284db95dc95d80b6ea");
@@ -62,7 +66,7 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   await migrate(pool);
   await migrate(pool); // Re-running migrations must preserve existing schema/data.
   const migrations = await pool.query("SELECT count(*)::int AS count FROM public.mingocell_migrations");
-  assert.equal(migrations.rows[0].count, 2);
+  assert.equal(migrations.rows[0].count, 3);
   const keptUser = await pool.query("SELECT role FROM mingocell_auth.users WHERE id = $1", [existingUser]);
   assert.equal(keptUser.rows[0].role, "admin");
   await assert.rejects(pool.query("UPDATE mingocell_auth.users SET role = 'maintainer' WHERE id = $1",
@@ -72,11 +76,15 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   const secret = "isolated-test-session-secret-32-characters";
   const requestLogs = [];
   const captureLogger = (level, event, fields = {}) => requestLogs.push({ level, event, ...fields });
+  const storageRoot = await mkdtemp(join(tmpdir(), "mingocell-images-"));
+  const imageStorage = imageStorageOptions(pool, { IMAGE_STORAGE_ROOT: storageRoot });
+  await initializeImageStorage(imageStorage);
+  t.after(() => rm(storageRoot, { recursive: true, force: true }));
   async function start({ secureCookies = false, trustLocalHttpsProxy = false } = {}) {
     const store = createSessionStore(pool);
     const app = createApp(() => pool.query("SELECT 1"), {
       pool, store, secret, secureCookies, trustLocalHttpsProxy, origins: [origin],
-    }, captureLogger);
+    }, captureLogger, imageStorage);
     const server = app.listen(0, "127.0.0.1");
     t.after(async () => {
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -94,13 +102,15 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   function browser(host = base) {
     return {
       cookie: "", csrf: "",
-      async request(path, { method = "GET", body, csrf = true, requestOrigin = origin, raw } = {}) {
-        const headers = { Origin: requestOrigin };
+      async request(path, { method = "GET", body, csrf = true, requestOrigin = origin, raw, form, extraHeaders = {} } = {}) {
+        const headers = { Origin: requestOrigin, ...extraHeaders };
         if (this.cookie) headers.Cookie = this.cookie;
         if (csrf && this.csrf) headers["X-CSRF-Token"] = this.csrf;
-        if (body !== undefined || raw !== undefined) headers["Content-Type"] = "application/json";
+        if (form === undefined && (body !== undefined || raw !== undefined) && !headers["Content-Type"]) {
+          headers["Content-Type"] = "application/json";
+        }
         const response = await fetch(`${host}${path}`, {
-          method, headers, body: raw ?? (body === undefined ? undefined : JSON.stringify(body)),
+          method, headers, body: form ?? raw ?? (body === undefined ? undefined : JSON.stringify(body)),
         });
         const setCookie = response.headers.get("set-cookie");
         if (setCookie) this.cookie = setCookie.split(";")[0];
@@ -108,6 +118,15 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
         const data = text ? JSON.parse(text) : null;
         if (data?.csrfToken) this.csrf = data.csrfToken;
         return { status: response.status, data, headers: response.headers };
+      },
+      async upload(bytes, key, filename = "cell.tif", type = "image/tiff") {
+        const form = new FormData();
+        form.set("image", new Blob([bytes], { type }), filename);
+        const extraHeaders = key ? { "Idempotency-Key": key } : {};
+        return this.request("/api/v1/submissions", { method: "POST", form, extraHeaders });
+      },
+      raw(path) {
+        return fetch(`${host}${path}`, { headers: { Origin: origin, Cookie: this.cookie } });
       },
       async login(rememberMe = false, loginPassword = password) {
         await this.request("/api/v1/auth/session");
@@ -189,6 +208,145 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
     assert.equal((await normal.request("/api/v1/auth/logout", { method: "POST" })).status, 204);
     assert.equal((await normal.request("/api/v1/auth/session")).data.user, null);
     assert.equal((await weekBrowser.request("/api/v1/auth/session")).data.user.id, weekSession.data.user.id);
+  });
+
+  await t.test("private image intake validates, expands TIFF pages and replays safely", async () => {
+    const singlePage = await sharp({
+      create: { width: 288, height: 288, channels: 3, background: "#6d2332" },
+    }).tiff().toBuffer();
+    const key = randomUUID();
+    const uploaded = await weekBrowser.upload(singlePage, key);
+    assert.equal(uploaded.status, 201);
+    assert.equal(uploaded.data.image.format, "tiff");
+    assert.equal(uploaded.data.image.pageCount, 1);
+    assert.equal(uploaded.data.submissions.length, 1);
+    assert.equal(uploaded.data.submissions[0].width, 288);
+    assert.equal(uploaded.data.submissions[0].height, 288);
+
+    const replayed = await weekBrowser.upload(singlePage, key);
+    assert.equal(replayed.status, 201);
+    assert.equal(replayed.headers.get("idempotency-replayed"), "true");
+    assert.deepEqual(replayed.data, uploaded.data);
+    const imageRows = await pool.query("SELECT count(*)::int AS count FROM mingocell_data.images WHERE owner_id = $1",
+      [weekSession.data.user.id]);
+    assert.equal(imageRows.rows[0].count, 1);
+
+    const submissionId = uploaded.data.submissions[0].id;
+    const detail = await weekBrowser.request(`/api/v1/submissions/${submissionId}`);
+    assert.equal(detail.status, 200);
+    assert.equal(detail.data.status, "uploaded");
+    const original = await weekBrowser.raw(`/api/v1/submissions/${submissionId}/image`);
+    assert.equal(original.status, 200);
+    assert.equal(original.headers.get("content-type"), "image/tiff");
+    assert.deepEqual(Buffer.from(await original.arrayBuffer()), singlePage);
+    const preview = await weekBrowser.raw(`/api/v1/submissions/${submissionId}/preview`);
+    assert.equal(preview.status, 200);
+    assert.equal(preview.headers.get("content-type"), "image/jpeg");
+    assert.ok((await preview.arrayBuffer()).byteLength > 0);
+
+    const secondEmail = `${randomUUID()}@example.org`;
+    const secondPassword = "Second test password 123!";
+    await createAccount(pool, secondEmail, secondPassword, "pathologist");
+    const second = browser();
+    await second.request("/api/v1/auth/session");
+    const secondLogin = await second.request("/api/v1/auth/login", {
+      method: "POST", body: { email: secondEmail, password: secondPassword, rememberMe: false },
+    });
+    assert.equal(secondLogin.status, 200);
+    assert.equal((await second.request(`/api/v1/submissions/${submissionId}`)).status, 404);
+    assert.equal((await second.raw(`/api/v1/submissions/${submissionId}/image`)).status, 404);
+
+    const multiPage = await sharp([
+      { create: { width: 288, height: 288, channels: 3, background: "#112233" } },
+      { create: { width: 288, height: 288, channels: 3, background: "#ddeeff" } },
+    ], { join: { animated: true } }).tiff().toBuffer();
+    const multi = await weekBrowser.upload(multiPage, randomUUID());
+    assert.equal(multi.status, 201);
+    assert.equal(multi.data.image.pageCount, 2);
+    assert.deepEqual(multi.data.submissions.map((submission) => submission.pageIndex), [0, 1]);
+    const firstPreview = Buffer.from(await (await weekBrowser.raw(multi.data.submissions[0].previewUrl)).arrayBuffer());
+    const secondPreview = Buffer.from(await (await weekBrowser.raw(multi.data.submissions[1].previewUrl)).arrayBuffer());
+    assert.notDeepEqual((await sharp(firstPreview).stats()).dominant, (await sharp(secondPreview).stats()).dominant);
+
+    const concurrentKey = randomUUID();
+    const otherInstance = browser(await start());
+    otherInstance.cookie = weekBrowser.cookie;
+    otherInstance.csrf = weekBrowser.csrf;
+    const concurrent = await Promise.all([
+      weekBrowser.upload(singlePage, concurrentKey),
+      otherInstance.upload(singlePage, concurrentKey),
+    ]);
+    assert.deepEqual(concurrent.map((response) => response.status), [201, 201]);
+    assert.deepEqual(concurrent[0].data, concurrent[1].data);
+    assert.equal(concurrent.filter((response) => response.headers.get("idempotency-replayed") === "true").length, 1);
+
+    const png = await sharp({
+      create: { width: 64, height: 48, channels: 4, background: "#224466" },
+    }).png().toBuffer();
+    const pngUpload = await weekBrowser.upload(png, randomUUID(), "cell.png", "image/png");
+    assert.equal(pngUpload.status, 201);
+    assert.equal(pngUpload.data.image.format, "png");
+    const jpeg = await sharp({
+      create: { width: 48, height: 64, channels: 3, background: "#664422" },
+    }).jpeg().toBuffer();
+    const jpegUpload = await weekBrowser.upload(jpeg, randomUUID(), "cell.jpg", "image/jpeg");
+    assert.equal(jpegUpload.status, 201);
+    assert.equal(jpegUpload.data.image.format, "jpeg");
+
+    const changedPayload = await sharp({
+      create: { width: 288, height: 288, channels: 3, background: "#ffffff" },
+    }).tiff().toBuffer();
+    assert.equal((await weekBrowser.upload(changedPayload, key)).status, 409);
+    assert.equal((await weekBrowser.upload(Buffer.from("not an image"), randomUUID())).status, 400);
+    assert.equal((await weekBrowser.upload(singlePage, "")).status, 400);
+    const malformed = await weekBrowser.request("/api/v1/submissions", {
+      method: "POST",
+      raw: "broken multipart",
+      extraHeaders: { "Content-Type": "multipart/form-data", "Idempotency-Key": randomUUID() },
+    });
+    assert.equal(malformed.status, 400);
+    assert.equal(malformed.data.error.code, "INVALID_MULTIPART");
+    const malformedBoundary = await weekBrowser.request("/api/v1/submissions", {
+      method: "POST",
+      raw: "broken multipart",
+      extraHeaders: { "Content-Type": "multipart/form-data; boundary=\"bad", "Idempotency-Key": randomUUID() },
+    });
+    assert.equal(malformedBoundary.status, 400);
+    assert.equal(malformedBoundary.data.error.code, "INVALID_MULTIPART");
+    const malformedHeader = await weekBrowser.request("/api/v1/submissions", {
+      method: "POST",
+      raw: "--bad\r\nMalformed header\r\n\r\ndata\r\n--bad--\r\n",
+      extraHeaders: { "Content-Type": "multipart/form-data; boundary=bad", "Idempotency-Key": randomUUID() },
+    });
+    assert.equal(malformedHeader.status, 400);
+    assert.equal(malformedHeader.data.error.code, "INVALID_MULTIPART");
+    const extraField = new FormData();
+    extraField.set("image", new Blob([singlePage], { type: "image/tiff" }), "cell.tif");
+    extraField.set("unexpected", "value");
+    const extraFieldResponse = await weekBrowser.request("/api/v1/submissions", {
+      method: "POST", form: extraField, extraHeaders: { "Idempotency-Key": randomUUID() },
+    });
+    assert.equal(extraFieldResponse.status, 400);
+    assert.equal(extraFieldResponse.data.error.code, "INVALID_MULTIPART");
+
+    const tooLargeByPixels = await sharp({
+      create: { width: 2001, height: 2000, channels: 3, background: "#000000" },
+    }).png().toBuffer();
+    const pixelsResponse = await weekBrowser.upload(tooLargeByPixels, randomUUID(), "large.png", "image/png");
+    assert.equal(pixelsResponse.status, 413);
+
+    const tooManyTotalPixels = await sharp(Array.from({ length: 6 }, (_, index) => ({
+      create: { width: 2000, height: 2000, channels: 3, background: index % 2 ? "#eeeeee" : "#111111" },
+    })), { join: { animated: true } }).tiff().toBuffer();
+    assert.ok(tooManyTotalPixels.byteLength < 5 * 1024 * 1024);
+    assert.equal((await weekBrowser.upload(tooManyTotalPixels, randomUUID())).status, 413);
+
+    const tooManyPages = await sharp(Array.from({ length: 21 }, (_, index) => ({
+      create: { width: 8, height: 8, channels: 3, background: index % 2 ? "#ffffff" : "#000000" },
+    })), { join: { animated: true } }).tiff().toBuffer();
+    assert.equal((await weekBrowser.upload(tooManyPages, randomUUID())).status, 413);
+    const tooManyBytes = Buffer.alloc(5 * 1024 * 1024 + 1, 1);
+    assert.equal((await weekBrowser.upload(tooManyBytes, randomUUID())).status, 413);
   });
 
   await t.test("server enforces expiry, password reset and deactivation", async () => {
