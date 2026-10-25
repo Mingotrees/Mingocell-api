@@ -66,7 +66,7 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   await migrate(pool);
   await migrate(pool); // Re-running migrations must preserve existing schema/data.
   const migrations = await pool.query("SELECT count(*)::int AS count FROM public.mingocell_migrations");
-  assert.equal(migrations.rows[0].count, 3);
+  assert.equal(migrations.rows[0].count, 4);
   const keptUser = await pool.query("SELECT role FROM mingocell_auth.users WHERE id = $1", [existingUser]);
   assert.equal(keptUser.rows[0].role, "admin");
   await assert.rejects(pool.query("UPDATE mingocell_auth.users SET role = 'maintainer' WHERE id = $1",
