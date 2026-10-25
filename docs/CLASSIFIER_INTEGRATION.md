@@ -6,9 +6,10 @@ Upload stores the immutable original and creates one submission per image/TIFF p
 Click **Analyze** on one image to queue only that submission. The API returns 202
 promptly, a background worker classifies it, and the browser polls the selected
 analysis every 15 seconds. Results survive navigation and reload at
-`/predictions/detail/?submission=<uuid>`. Sample cases use the separate `id` query.
-History/expert-review screens still contain illustrative sample records, not live
-review storage. Live results do not offer a misleading sample review-save action.
+`/predictions/detail/?submission=<uuid>`. History and Review Cases browse saved
+backend records. On completed, referred analyses, admins and pathologists can
+append expert decisions through `/api/v1/submissions/:id/reviews` after migration
+`006_expert_reviews.sql`. Expert decisions preserve the original classifier output.
 
 ## API
 

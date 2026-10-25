@@ -151,6 +151,8 @@ Full request/response schemas, errors, pagination, and examples live in
 | GET | `/api/v1/submissions/:id/preview` | Retrieve browser preview |
 | POST | `/api/v1/submissions/:id/analysis` | Enqueue selected image/page; pathologist or admin role required |
 | GET | `/api/v1/submissions/:id/analysis` | Retrieve job state and result |
+| GET | `/api/v1/submissions/:id/reviews` | Owned, paginated expert-review history |
+| POST | `/api/v1/submissions/:id/reviews` | Append expert decision; admin or pathologist, owned referred result |
 
 Browser requests use `credentials: 'include'`. Bootstrap the session first, then
 send its latest `X-CSRF-Token` on writes with an allowed `Origin`. Uploads also
@@ -163,8 +165,21 @@ Poll only the selected active job, initially every 15 seconds, and back off on e
 
 > [!IMPORTANT]
 > API readiness checks the database and storage, not classifier availability.
-> Expert-review persistence has no endpoint yet; illustrative frontend review
-> records are not live clinical records.
+> Expert-review storage requires migration `006_expert_reviews.sql`. Decisions
+> are separate append-only records; original classifier output is never overwritten.
+
+### Expert decisions
+
+Both roles can review their own completed, model-referred submissions. `Confirmed`
+retains the original stage, `Reclassified` assigns another of the six stage codes,
+and `Unresolved` assigns no expert stage. The server records reviewer ID, email,
+role, timestamp, and sequential revision. Notes are limited to 2000 characters.
+
+Writes require a UUID `Idempotency-Key` and the latest `previousReviewId` (or null
+for the first decision). Retry uncertain delivery with the same key and body.
+Stale reviews return `409 REVIEW_CONFLICT`; refresh history before appending a new
+decision. Database triggers reject updates, deletes, and truncation of review rows.
+Reads return newest-first pages, using `limit` and `before` revision parameters.
 
 ### Image and queue limits
 

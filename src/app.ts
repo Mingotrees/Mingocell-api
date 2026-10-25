@@ -6,6 +6,7 @@ import { HttpError, type AuthOptions, type PublicUser } from "./auth/middleware.
 import { mountAuth } from "./auth/routes.js";
 import { mountImageRoutes } from "./images/routes.js";
 import { mountAnalysisRoutes } from './analysis/routes.js';
+import { mountReviewRoutes } from './reviews/routes.js';
 import { checkImageStorage, type ImageStorageOptions } from "./images/storage.js";
 import { logger as defaultLogger, safeErrorType, type Logger, type LogFields } from "./logging.js";
 
@@ -77,6 +78,7 @@ export function createApp(
     if (imageStorage) {
       mountImageRoutes(app, imageStorage);
       mountAnalysisRoutes(app, imageStorage.pool);
+      mountReviewRoutes(app, imageStorage.pool);
     }
   }
 
