@@ -149,7 +149,7 @@ Full request/response schemas, errors, pagination, and examples live in
 | GET | `/api/v1/submissions/:id` | Submission metadata |
 | GET | `/api/v1/submissions/:id/image` | Download immutable original |
 | GET | `/api/v1/submissions/:id/preview` | Retrieve browser preview |
-| POST | `/api/v1/submissions/:id/analysis` | Enqueue selected image/page; pathologist role required |
+| POST | `/api/v1/submissions/:id/analysis` | Enqueue selected image/page; pathologist or admin role required |
 | GET | `/api/v1/submissions/:id/analysis` | Retrieve job state and result |
 
 Browser requests use `credentials: 'include'`. Bootstrap the session first, then
@@ -190,8 +190,9 @@ npm run account -- reset-password researcher@example.org
 npm run account -- deactivate researcher@example.org
 ```
 
-There is no public signup or browser account-administration page. `admin` does
-not inherit `pathologist` permissions. Password reset and deactivation revoke
+There is no public signup or browser account-administration page. Both `admin`
+and `pathologist` can request analysis of their own submissions; roles otherwise
+remain explicit rather than hierarchical. Password reset and deactivation revoke
 active sessions; normal sessions expire after 8 hours, or 7 days with remember-me.
 
 ## Testing

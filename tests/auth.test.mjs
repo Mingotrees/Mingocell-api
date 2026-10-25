@@ -45,6 +45,23 @@ test("pathologist permission excludes admin and anonymous users", () => {
   assert.doesNotThrow(() => validateProxyBinding("127.0.0.1", { trustLocalHttpsProxy: true }));
 });
 
+test("explicit multi-role permission admits admins and pathologists only", () => {
+  const guard = requireRole("pathologist", "admin");
+  for (const [user, status] of [
+    [undefined, 401],
+    [{ role: "admin" }, undefined],
+    [{ role: "pathologist" }, undefined],
+    [{ role: "unsupported" }, 403],
+  ]) {
+    let called = false;
+    guard({}, { locals: { user } }, (error) => {
+      called = true;
+      assert.equal(error?.status, status);
+    });
+    assert.equal(called, true);
+  }
+});
+
 test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DATABASE_URL }, async (t) => {
   const url = new URL(process.env.TEST_DATABASE_URL);
   assert.equal(url.pathname, "/mingocell_test", "Integration tests require isolated mingocell_test database");

@@ -7,7 +7,7 @@ export function mountAnalysisRoutes(app: Express, pool: Pool) {
   app.get('/api/v1/submissions/:id/analysis',requireAuth,async (req,res) => {
     res.json(await getAnalysis(pool,String(req.params.id),(res.locals.user as PublicUser).id));
   });
-  app.post('/api/v1/submissions/:id/analysis',requireRole('pathologist'),async (req,res,next) => {
+  app.post('/api/v1/submissions/:id/analysis',requireRole('pathologist','admin'),async (req,res,next) => {
     try {
       const {analysis} = await enqueueAnalysis(pool,String(req.params.id),(res.locals.user as PublicUser).id);
       res.setHeader('Location',analysis.statusUrl);
