@@ -42,7 +42,7 @@ back off on errors, and stop when hidden or terminal. Full response type lives i
 | Predictions/inference | **Available** | Explicit per-image analysis; classifier worker deployment required |
 | Submission detail and image access | **Available** | Owner-scoped detail, original, and preview endpoints |
 | Submission history | **Available** | Owner-only list, cursor pagination, analysis-status filter |
-| Expert review | **Unavailable** | Role guard exists, but no review endpoint |
+| Expert review | **Available after migration 006** | Both roles; append-only decisions on owned, completed referred results |
 | Realtime updates | **Unavailable** | No WebSocket, SSE, or event contract |
 
 The frontend can currently implement health display, authentication, image
@@ -794,6 +794,51 @@ deliberate upload and retain it until that upload succeeds or is abandoned.
 
 ## Authorization
 
+### Expert review contract
+
+Apply `006_expert_reviews.sql` before enabling these endpoints.
+
+`GET /api/v1/submissions/:id/reviews?limit=20&before=<revision>` returns:
+
+```ts
+type ExpertReview = {
+  id: string; submissionId: string; analysisId: string; revision: number;
+  disposition: 'Confirmed' | 'Reclassified' | 'Unresolved';
+  stage: 'MYO' | 'PMO' | 'MYB' | 'MMZ' | 'NGB' | 'NGS' | null;
+  notes: string; createdAt: string;
+  reviewer: { id: string; email: string; role: 'admin' | 'pathologist' };
+};
+type ReviewPage = {
+  submissionId: string; reviews: ExpertReview[];
+  pageInfo: { hasMore: boolean; nextBefore: number | null };
+};
+```
+
+Reviews are newest revision first. `limit` is 1–100 (default 20); `before` is
+the previous response's `nextBefore`, omitted for the latest page.
+
+`POST /api/v1/submissions/:id/reviews` requires the current owner's session,
+either role, allowed Origin, CSRF, and a UUID `Idempotency-Key`. Body:
+
+```json
+{"disposition":"Reclassified","stage":"PMO","notes":"Morphological reasoning.","previousReviewId":null}
+```
+
+`previousReviewId` is required and must match the latest saved review; use null
+only for the first decision. `stage` is a different supported stage when
+reclassifying; omit it or send null for Confirmed/Unresolved. Confirmed stores
+the original predicted class; Unresolved stores null. Notes default to empty,
+are trimmed, and have a 2000-character limit. Client-supplied reviewer IDs,
+roles, timestamps, and other unknown fields are rejected.
+
+Success is `201 { review: ExpertReview }`. Replaying identical key/body returns
+the original review with `Idempotency-Replayed: true`, without adding a row.
+Changed normalized decision data under a reused key returns `409 IDEMPOTENCY_CONFLICT`. A stale
+`previousReviewId` returns `409 REVIEW_CONFLICT`; reload history and preserve the
+user's draft. Unfinished or non-referred results return `409 REVIEW_NOT_AVAILABLE`.
+Unowned/malformed submission IDs return 404; anonymous access returns 401 and
+invalid Origin/CSRF returns 403. Original AI results are never modified.
+
 | Operation | Anonymous | `pathologist` | `admin` |
 | --- | --- | --- | --- |
 | Health checks | Allowed | Allowed | Allowed |
@@ -804,6 +849,8 @@ deliberate upload and retain it until that upload succeeds or is abandoned.
 | Read submission/original/preview | Denied | Own records | Own records |
 | Request/retry analysis | Denied | Own records | Own records |
 | Read analysis state/result | Denied | Own records | Own records |
+| Submit expert decision | Denied | Own completed referred results | Own completed referred results |
+| Read expert review history | Denied | Own records | Own records |
 | Pathologist-only future route | Denied | Allowed | Denied |
 
 Roles are explicit, not hierarchical. Analysis requests allow both `pathologist`

@@ -14,6 +14,7 @@ import { migrate } from "../dist/database/migration-runner.js";
 import { hashPassword, normalizeEmail, verifyPassword } from "../dist/auth/passwords.js";
 import { imageStorageOptions, initializeImageStorage } from "../dist/images/storage.js";
 import { analysisTests } from './analysis-integration.mjs';
+import { reviewTests } from './reviews-integration.mjs';
 
 test("email normalization and salted password verification", async () => {
   assert.equal(normalizeEmail("  Expert@Example.org "), "expert@example.org");
@@ -84,7 +85,7 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   await migrate(pool);
   await migrate(pool); // Re-running migrations must preserve existing schema/data.
   const migrations = await pool.query("SELECT count(*)::int AS count FROM public.mingocell_migrations");
-  assert.equal(migrations.rows[0].count, 5);
+  assert.equal(migrations.rows[0].count, 6);
   const keptUser = await pool.query("SELECT role FROM mingocell_auth.users WHERE id = $1", [existingUser]);
   assert.equal(keptUser.rows[0].role, "admin");
   await assert.rejects(pool.query("UPDATE mingocell_auth.users SET role = 'maintainer' WHERE id = $1",
@@ -435,6 +436,12 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   const analysisOwner = analysisBrowser();
   await analysisOwner.login();
   await analysisTests(t, {pool, storage: imageStorage, browser: analysisBrowser, owner: analysisOwner, ownerId: weekSession.data.user.id});
+
+  const reviewBase = await start();
+  const reviewBrowser = () => browser(reviewBase);
+  const reviewOwner = reviewBrowser();
+  await reviewOwner.login();
+  await reviewTests(t, { pool, browser: reviewBrowser, owner: reviewOwner, ownerId: weekSession.data.user.id });
 
   await t.test("server enforces expiry, password reset and deactivation", async () => {
     await pool.query(`UPDATE mingocell_auth.sessions SET sess = jsonb_set(sess::jsonb,
