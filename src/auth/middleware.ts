@@ -85,10 +85,10 @@ export const requireAuth: RequestHandler = (_req, res, next) => {
   next();
 };
 
-export function requireRole(role: Role): RequestHandler {
+export function requireRole(...roles: Role[]): RequestHandler {
   return (_req, res, next) => {
     if (!res.locals.user) return next(new HttpError(401, "UNAUTHENTICATED", "Sign in to continue."));
-    if (res.locals.user.role !== role) {
+    if (!roles.includes(res.locals.user.role)) {
       return next(new HttpError(403, "FORBIDDEN", "Your account cannot perform this action."));
     }
     next();

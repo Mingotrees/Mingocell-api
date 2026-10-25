@@ -19,11 +19,11 @@ source of truth. Report the drift and update this file with the backend change.
 ### Per-image analysis (feature branch; requires worker deployment)
 
 `POST /api/v1/submissions/:id/analysis` queues one stored image/page. Requires
-owner session, pathologist role, Origin and X-CSRF-Token. Upload never enqueues.
+owner session, pathologist or admin role, Origin and X-CSRF-Token. Upload never enqueues.
 Returns `{ analysis }`, 202 for queued/running, 200 for existing terminal state.
 Repeated requests reuse one job. `GET` at the same path returns owned state/result
 or `{ analysis: { state: "not_requested", submissionId } }`. Unknown/unowned IDs
-return 404; admin enqueue 403; unauthenticated 401. Queue full returns 429
+return 404 for either role; unauthenticated 401. Queue full returns 429
 `ANALYSIS_QUEUE_FULL` with `Retry-After: 30`. Poll selected analysis every 15 seconds,
 back off on errors, and stop when hidden or terminal. Full response type lives in
 `src/analysis/types.ts`; worker/provenance details in `docs/CLASSIFIER_INTEGRATION.md`.
@@ -802,12 +802,14 @@ deliberate upload and retain it until that upload succeeds or is abandoned.
 | Logout | Denied | Allowed | Allowed |
 | Upload image | Denied | Own records | Own records |
 | Read submission/original/preview | Denied | Own records | Own records |
+| Request/retry analysis | Denied | Own records | Own records |
+| Read analysis state/result | Denied | Own records | Own records |
 | Pathologist-only future route | Denied | Allowed | Denied |
 
-Roles are exact, not hierarchical. `admin` does not inherit `pathologist`
-permission. Image access is based on ownership rather than role; administrators
-cannot read another user's images. No currently exposed product endpoint uses a
-role guard, so do not infer additional role capabilities.
+Roles are explicit, not hierarchical. Analysis requests allow both `pathologist`
+and `admin`; this does not grant admins every pathologist-only permission.
+Image and analysis access is based on ownership; administrators cannot read or
+analyze another user's submissions.
 
 ## Frontend Agent Checklist
 

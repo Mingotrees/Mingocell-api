@@ -12,9 +12,9 @@ review storage. Live results do not offer a misleading sample review-save action
 
 ## API
 
-`POST /api/v1/submissions/:id/analysis` requires owner session, pathologist role,
-allowed Origin and X-CSRF-Token. No file body is needed. Admin does not inherit
-pathologist permissions. Repeating POST returns the same job: 202 queued/running,
+`POST /api/v1/submissions/:id/analysis` requires owner session, pathologist or admin
+role, allowed Origin and X-CSRF-Token. No file body is needed. Both roles can
+analyze only their own submissions. Repeating POST returns the same job: 202 queued/running,
 200 succeeded/failed. Successful results are immutable in this increment.
 
 `GET /api/v1/submissions/:id/analysis` requires authenticated ownership. Returns
