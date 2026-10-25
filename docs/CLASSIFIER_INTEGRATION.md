@@ -143,6 +143,29 @@ harness initializes schema, so use fresh database for every full run.
 
 ## Deployment and rollback
 
+### Required CI check
+
+`Backend CI` runs on branch pushes, PRs targeting main, and manual runs. It runs
+Node24/PostgreSQL16 tests, Python3.13/Pillow13 decoder fixtures, hidden-password CLI
+checks, workflow lint, and runtime-artifact packaging. CI explicitly requires the
+database URL and decoder interpreter so integration suites are not silently skipped.
+No production database, service token or model bundle is used.
+
+`npm run package:runtime -- <new-directory>` packages only compiled dist, migrations,
+the TIFF helper, worker deployment scripts and package manifests. Missing required
+files or symlinks fail packaging; .env, uploaded storage, tests and unrelated scripts
+are excluded. The directory must not exist, preventing stale artifact reuse. CI
+retains `backend-runtime-<sha>` for three days. The separate main-only deploy job
+requires CI success and downloads that same-run artifact; it does not rebuild.
+
+Main protection must require **Backend CI** from GitHub Actions and an up-to-date PR,
+including administrators, with no force pushes/deletion. Investigate failures in the
+CI job before rerunning; never bypass checks to test a patch in production. Dependency
+updates should change package manifest/lock together and pass the complete disposable
+database/decoder test commands above. Classifier main currently needs its owner to
+require the existing `package` check; current API/frontend account has no admin access
+there. Settings enforcement must be verified through GitHub, not inferred from YAML.
+
 Feature branch pushes run tests only; main deploys automatically after merge.
 New backend workflow stages dist/scripts/config/migrations in private
 `.classifier-analysis-stage`, runs classifier/decoder preflight, then drains old

@@ -1,8 +1,8 @@
-name: Test and deploy to DCISM
+name: Backend CI and deployment
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -10,15 +10,14 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: dcism-backend-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  deploy:
-    name: Test, build and deploy
+  ci:
+    name: Backend CI
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: backend-ci-${{ github.ref }}
+      cancel-in-progress: true
     services:
       postgres:
         image: postgres:16-alpine
@@ -37,6 +36,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
@@ -48,6 +49,7 @@ jobs:
         run: npm ci
 
       - name: Set up Python for classifier input tests
+        id: python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -58,15 +60,51 @@ jobs:
       - name: Test and build
         env:
           TEST_DATABASE_URL: postgresql://mingocell_test:ci-test-only@127.0.0.1:5432/mingocell_test
-          CLASSIFIER_PYTHON: ${{ env.pythonLocation }}/bin/python
+          CLASSIFIER_PYTHON: ${{ steps.python.outputs.python-path }}
         run: |
+          test -n "$TEST_DATABASE_URL"
+          test -x "$CLASSIFIER_PYTHON"
           npm test
           python3 tests/account-cli.py
           python3 tests/classifier-input.py
           test -f dist/server.js
 
+      - name: Validate GitHub workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes= .github/workflows/deploy.yml
+
+      - name: Package tested runtime
+        run: npm run package:runtime -- "$RUNNER_TEMP/backend-runtime"
+
+      - name: Store tested runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/backend-runtime/
+          if-no-files-found: error
+          retention-days: 3
+
+  deploy:
+    name: Deploy backend to DCISM
+    needs: ci
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: dcism-backend-production
+      cancel-in-progress: false
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Download tested runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-runtime-${{ github.sha }}
+          path: .
+
       - name: Deploy backend
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           SSH_PRIVATE_KEY: ${{ secrets.DCISM_SSH_KEY }}
           SSH_KNOWN_HOSTS: ${{ secrets.DCISM_KNOWN_HOSTS }}

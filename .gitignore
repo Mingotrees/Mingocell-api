@@ -174,3 +174,4 @@ Thumbs.db
 
 # Generated Graphify analysis and visualizations
 /graphify-out/
+/runtime/
