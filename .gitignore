@@ -81,10 +81,12 @@ out
 # TypeScript build output and framework build artifacts
 .nuxt
 dist
+__pycache__/
 .output
 
 dataset/
 docs/*
+!docs/CLASSIFIER_INTEGRATION.md
 # Gatsby files
 .cache/
 # Comment in the public line in if your project uses Gatsby and not Next.js

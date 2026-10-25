@@ -6,8 +6,8 @@
 | Field | Value |
 | --- | --- |
 | Contract status | Current implementation plus explicit gaps |
-| Last verified | 2026-10-05 |
-| Backend commit | Pending commit, based on `85f545b` |
+| Last verified | 2026-10-25 (local checks; production deployment pending) |
+| Backend commit | Feature branch `feat/classifier-analysis`, based on `edae498` |
 | Production API | `https://api-mingocell.dcism.org` |
 | Production frontend | `https://mingocells.dcism.org` |
 
@@ -15,6 +15,18 @@ If this document conflicts with backend behavior, tests and source code are the
 source of truth. Report the drift and update this file with the backend change.
 
 ## Capability Matrix
+
+### Per-image analysis (feature branch; requires worker deployment)
+
+`POST /api/v1/submissions/:id/analysis` queues one stored image/page. Requires
+owner session, pathologist role, Origin and X-CSRF-Token. Upload never enqueues.
+Returns `{ analysis }`, 202 for queued/running, 200 for existing terminal state.
+Repeated requests reuse one job. `GET` at the same path returns owned state/result
+or `{ analysis: { state: "not_requested", submissionId } }`. Unknown/unowned IDs
+return 404; admin enqueue 403; unauthenticated 401. Queue full returns 429
+`ANALYSIS_QUEUE_FULL` with `Retry-After: 30`. Poll selected analysis every 15 seconds,
+back off on errors, and stop when hidden or terminal. Full response type lives in
+`src/analysis/types.ts`; worker/provenance details in `docs/CLASSIFIER_INTEGRATION.md`.
 
 | Capability | Status | Notes |
 | --- | --- | --- |
@@ -27,14 +39,14 @@ source of truth. Report the drift and update this file with the backend change.
 | Browser password reset | **Unavailable** | Server CLI only |
 | Browser account administration | **Unavailable** | Server CLI only, including for `admin` users |
 | Image/file upload | **Available** | Private PNG, JPEG, and TIFF intake |
-| Predictions/inference | **Unavailable** | No model endpoint or inference readiness check |
+| Predictions/inference | **Available** | Explicit per-image analysis; classifier worker deployment required |
 | Submission detail and image access | **Available** | Owner-scoped detail, original, and preview endpoints |
-| Submission history | **Unavailable** | No list or filter endpoint |
+| Submission history | **Available** | Owner-only list, cursor pagination, analysis-status filter |
 | Expert review | **Unavailable** | Role guard exists, but no review endpoint |
 | Realtime updates | **Unavailable** | No WebSocket, SSE, or event contract |
 
 The frontend can currently implement health display, authentication, image
-upload, and immediate submission detail. Product screens for unavailable
+upload, submission history, and submission detail. Product screens for unavailable
 capabilities need mocked local data or an explicit backend contract before
 integration.
 
@@ -104,6 +116,7 @@ export type SessionResponse = {
 export type UploadResponse = {
   image: {
     id: string;
+    originalFilename: string | null;
     format: "jpeg" | "png" | "tiff";
     byteSize: number;
     pageCount: number;
@@ -112,6 +125,7 @@ export type UploadResponse = {
   };
   submissions: Array<{
     id: string;
+    displayName: string;
     pageIndex: number;
     width: number;
     height: number;
@@ -145,12 +159,14 @@ export type ReadyResponse =
 
 export type SubmissionResponse = {
   id: string;
+  displayName: string;
   pageIndex: number;
   width: number;
   height: number;
   status: "uploaded" | "analyzed" | "failed";
   createdAt: string;
   source: {
+    originalFilename: string | null;
     format: "jpeg" | "png" | "tiff";
     byteSize: number;
     sha256: string;
@@ -159,10 +175,32 @@ export type SubmissionResponse = {
   imageUrl: string;
   previewUrl: string;
 };
+
+export type SubmissionHistoryResponse = {
+  submissions: SubmissionResponse[];
+  pageInfo: { hasMore: boolean; nextCursor: string | null };
+};
 ```
 
 Do not depend on internal fields such as `active`, `auth_version`, password
 hashes, or database timestamps. They are not part of the public contract.
+
+### Doctor-facing image labels
+
+Render `submission.displayName` as the review label, never a storage token or URL.
+New uploads preserve the uploaded basename in `image.originalFilename`; submission
+details return it in `source.originalFilename`. Path components, control characters,
+and bidirectional formatting controls are removed, and names are limited to 255
+Unicode code points. Render labels as text, not HTML.
+
+Single-page labels use the filename, such as `Patient42_slide3.tif`. Multipage
+labels append a one-based page number: `Patient42_slide3.tif — Page 2`.
+Existing uploads have a null original filename and use `Submission <UUID>` as
+their fallback label. Filenames are not unique; continue using submission IDs
+for selection and review actions. A retry with the same idempotency key keeps
+the first upload's name, even if the retry's filename changes. Cached upload
+responses created before this feature may lack these new fields; fetch submission
+details for their fallback label.
 
 ## Authentication State Machine
 
@@ -205,8 +243,8 @@ current browser session.
 
 ## Endpoint Catalog
 
-Submission read endpoints use a UUID path parameter. There are no query
-parameters in the current API.
+Submission detail and image endpoints use a UUID path parameter. Submission
+history accepts the query parameters documented below.
 
 ### `GET /health/live`
 
@@ -404,6 +442,7 @@ Success `201`:
 {
   "image": {
     "id": "0aa26902-2192-4fdf-8d34-d31993a66f02",
+    "originalFilename": "Patient42_slide3.tif",
     "format": "tiff",
     "byteSize": 243118,
     "pageCount": 1,
@@ -413,6 +452,7 @@ Success `201`:
   "submissions": [
     {
       "id": "488b9de8-470d-460b-82f2-0106aff5bc26",
+      "displayName": "Patient42_slide3.tif",
       "pageIndex": 0,
       "width": 288,
       "height": 288,
@@ -451,6 +491,36 @@ key for a deliberate second submission of the same image.
 | `500` | `INTERNAL_ERROR` | Persistence or processing failed |
 | `507` | `STORAGE_QUOTA_EXCEEDED`, `STORAGE_CAPACITY_LOW` | Owner quota or server free-space reserve reached |
 
+### `GET /api/v1/submissions`
+
+Returns only the signed-in user's uploads, including doctor-facing labels and
+image URLs. Doctors cannot browse another doctor's submissions. This ownership
+rule also applies to existing detail, original, and preview endpoints.
+
+Query parameters (optional):
+
+| Parameter | Values | Default |
+| --- | --- | --- |
+| `limit` | Integer 1–100 | `20` |
+| `status` | `uploaded`, `analyzed`, or `failed` | All statuses |
+| `cursor` | Opaque `pageInfo.nextCursor` from previous page | First page |
+
+Rows sort by creation time descending, then submission UUID descending to break
+ties. Each TIFF page is one row. Status refers to analysis, not doctor review;
+uploads remain `uploaded` until an explicit analysis completes or fails.
+
+Success `200` is `SubmissionHistoryResponse`: `submissions` contains the same
+objects as the detail endpoint; `pageInfo.hasMore` indicates another page and
+`pageInfo.nextCursor` is null at the end. An empty history returns an empty array
+with `hasMore: false` and `nextCursor: null`.
+
+Example request: `/api/v1/submissions?limit=20&status=uploaded`. For the next page,
+keep the same status filter and append `cursor=${encodeURIComponent(nextCursor)}`.
+Reset the cursor when changing filters. Do not decode or construct cursors.
+
+Errors: `400 INVALID_INPUT` for invalid query values/cursors or a changed cursor
+status filter; `401 UNAUTHENTICATED` when not signed in.
+
 ### `GET /api/v1/submissions/:id`
 
 Returns persisted metadata for a submission owned by the authenticated user.
@@ -469,7 +539,7 @@ MIME type, `Content-Length`, attachment disposition, and
 ### `GET /api/v1/submissions/:id/preview`
 
 Streams the submission page's JPEG preview inline. Requires ownership. The
-preview is for browser display only; future inference must use the original page.
+preview is for browser display only; inference uses the original image/page.
 `imageUrl` and `previewUrl` are API-relative paths. Resolve them against
 `NEXT_PUBLIC_API_URL`, not the frontend origin:
 
@@ -601,6 +671,7 @@ export type SessionResponse = {
 export type UploadResponse = {
   image: {
     id: string;
+    originalFilename: string | null;
     format: "jpeg" | "png" | "tiff";
     byteSize: number;
     pageCount: number;
@@ -609,6 +680,7 @@ export type UploadResponse = {
   };
   submissions: Array<{
     id: string;
+    displayName: string;
     pageIndex: number;
     width: number;
     height: number;
@@ -754,8 +826,9 @@ role guard, so do not infer additional role capabilities.
 - Treat every returned TIFF page as its own submission and keep `pageIndex`.
 - Resolve `imageUrl` and `previewUrl` against `NEXT_PUBLIC_API_URL`. Use the
   preview for display; never use preview bytes as model input.
-- Do not show signup, reset-password, prediction, history, or review as connected
-  features until backend endpoints exist.
+- Do not show signup, browser password reset, or expert review as connected features.
+  Use explicit analysis endpoints for live results; existing sample history/review
+  screens are still illustrative until their frontend integration is implemented.
 - Never log passwords, cookies, CSRF tokens, or full authentication request bodies.
 
 ## Contract Maintenance

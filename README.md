@@ -58,7 +58,8 @@ from production. `npm run dev` uses development cookies for local HTTP;
 Liveness returns `{"status":"ok","service":"mingocell-api"}`. Database and
 image-storage readiness is `GET /health/ready`, returning `{"status":"ready"}`
 or HTTP 503.
-Inference is not connected yet.
+On-demand inference requires the classifier worker described below; API readiness
+does not imply classifier readiness.
 
 ## Private image storage
 
@@ -66,11 +67,11 @@ Authenticated users can upload one PNG, JPEG, or TIFF to
 `POST /api/v1/submissions`. Limits are 5 MiB per file, 4,000,000 pixels per page,
 20,000,000 pixels across the file, and 20 TIFF pages. Each TIFF page must be an
 independent cell image and becomes one `uploaded` submission. Uploaded does not
-mean analyzed; inference is still unavailable.
+mean analyzed; classification starts only on an explicit Analyze request.
 
 Original files remain immutable. Browser previews are separate JPEG derivatives.
-Model preprocessing will read the original page during future inference and will
-not persist intermediate images or tensors.
+The classifier reads the original image/page during inference; intermediate images
+and tensors are not persisted.
 
 Local development defaults to the gitignored `storage/` directory. Production
 uses this private path outside the deployment and Apache document roots:
@@ -203,6 +204,14 @@ Updates happen in place and may briefly interrupt requests. There is no automati
 rollback: if installation, restart, or verification fails, inspect PM2 logs and
 redeploy a known-good revision. A successful health check confirms liveness,
 not database readiness or inference availability.
+
+## On-demand classification
+
+Upload stores images only. Pathologists click **Analyze** on an individual image or
+TIFF page; a PostgreSQL-backed worker calls the local authenticated classifier and
+persists result/provenance. Frontend polls selected analysis and restores saved
+results on refresh. See [classifier integration runbook](docs/CLASSIFIER_INTEGRATION.md)
+for setup, queue limits, recovery, deployment and verification.
 
 ## Authentication setup
 
