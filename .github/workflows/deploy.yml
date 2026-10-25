@@ -1,8 +1,8 @@
-name: Test and deploy to DCISM
+name: Backend CI and deployment
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -10,15 +10,14 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: dcism-backend-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  deploy:
-    name: Test, build and deploy
+  ci:
+    name: Backend CI
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: backend-ci-${{ github.ref }}
+      cancel-in-progress: true
     services:
       postgres:
         image: postgres:16-alpine
@@ -37,6 +36,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
@@ -47,16 +48,63 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Set up Python for classifier input tests
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install canonical decoder version
+        run: python -m pip install Pillow==13.0.0
+
       - name: Test and build
         env:
           TEST_DATABASE_URL: postgresql://mingocell_test:ci-test-only@127.0.0.1:5432/mingocell_test
+          CLASSIFIER_PYTHON: ${{ steps.python.outputs.python-path }}
         run: |
+          test -n "$TEST_DATABASE_URL"
+          test -x "$CLASSIFIER_PYTHON"
           npm test
           python3 tests/account-cli.py
+          python3 tests/classifier-input.py
           test -f dist/server.js
 
+      - name: Validate GitHub workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes= .github/workflows/deploy.yml
+
+      - name: Package tested runtime
+        run: npm run package:runtime -- "$RUNNER_TEMP/backend-runtime"
+
+      - name: Store tested runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/backend-runtime/
+          if-no-files-found: error
+          retention-days: 3
+
+  deploy:
+    name: Deploy backend to DCISM
+    needs: ci
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: dcism-backend-production
+      cancel-in-progress: false
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Download tested runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-runtime-${{ github.sha }}
+          path: .
+
       - name: Deploy backend
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           SSH_PRIVATE_KEY: ${{ secrets.DCISM_SSH_KEY }}
           SSH_KNOWN_HOSTS: ${{ secrets.DCISM_KNOWN_HOSTS }}
@@ -126,20 +174,52 @@ jobs:
           pm2 describe mingocell-api >/dev/null
           REMOTE
 
-          # Only dist/ is mirrored with deletion. Persistent files stay untouched.
+          # Stage new code first. Live worker must drain before dist/ replacement.
+          $SSH_COMMAND "$TARGET" 'install -d -m 700 /data/users/s22101440/api-mingocell.dcism.org/.classifier-analysis-stage'
           rsync -az --delete-delay --delay-updates --timeout=120 \
-            -e "$SSH_COMMAND" dist/ "$TARGET:$DCISM_DEPLOY_PATH/dist/"
+            -e "$SSH_COMMAND" dist/ "$TARGET:$DCISM_DEPLOY_PATH/.classifier-analysis-stage/dist/"
           rsync -az --delay-updates --timeout=120 \
-            -e "$SSH_COMMAND" package.json package-lock.json "$TARGET:$DCISM_DEPLOY_PATH/"
+            -e "$SSH_COMMAND" package.json package-lock.json "$TARGET:$DCISM_DEPLOY_PATH/.classifier-analysis-stage/"
           rsync -az --delay-updates --timeout=120 \
-            -e "$SSH_COMMAND" migrations/ "$TARGET:$DCISM_DEPLOY_PATH/migrations/"
+            -e "$SSH_COMMAND" migrations/ "$TARGET:$DCISM_DEPLOY_PATH/.classifier-analysis-stage/migrations/"
+          rsync -az --delay-updates --timeout=120 \
+            -e "$SSH_COMMAND" scripts/ "$TARGET:$DCISM_DEPLOY_PATH/.classifier-analysis-stage/scripts/"
+          rsync -az --delay-updates --timeout=120 \
+            -e "$SSH_COMMAND" deploy/ "$TARGET:$DCISM_DEPLOY_PATH/.classifier-analysis-stage/deploy/"
 
           $SSH_COMMAND "$TARGET" "bash -se" <<'REMOTE'
           set -euo pipefail
           cd /data/users/s22101440/api-mingocell.dcism.org
+          node --env-file-if-exists=.env .classifier-analysis-stage/deploy/check-analysis-worker.mjs --preflight
+          export ANALYSIS_PREVIOUS_INSTANCE
+          ANALYSIS_PREVIOUS_INSTANCE=$(node --env-file-if-exists=.env --input-type=module -e '
+            import {pool} from "./dist/database/pool.js";
+            try {
+              const exists = await pool.query("SELECT to_regclass($1) AS name", ["mingocell_data.classification_worker"]);
+              if (exists.rows[0].name) {
+                const row = await pool.query("SELECT instance_id FROM mingocell_data.classification_worker");
+                process.stdout.write(row.rows[0]?.instance_id || "");
+              }
+            } finally { await pool.end(); }
+          ')
+          trap 'printf "%s\n" "Deployment interrupted; check mingocell-classification-worker before resuming analysis." >&2' ERR
+          if pm2 describe mingocell-classification-worker >/dev/null 2>&1; then
+            pm2 stop mingocell-classification-worker
+          fi
+          rsync -a --delete-delay .classifier-analysis-stage/dist/ dist/
+          rsync -a .classifier-analysis-stage/package.json .classifier-analysis-stage/package-lock.json ./
+          rsync -a .classifier-analysis-stage/migrations/ migrations/
+          rsync -a .classifier-analysis-stage/scripts/ scripts/
+          rsync -a .classifier-analysis-stage/deploy/ deploy/
           npm ci --omit=dev
           npm run migrate
           pm2 restart mingocell-api --update-env
+          pm2 startOrRestart deploy/ecosystem.config.cjs --update-env
+          for attempt in {1..15}; do
+            if node --env-file-if-exists=.env deploy/check-analysis-worker.mjs; then break; fi
+            if [[ "$attempt" == 15 ]]; then exit 1; fi
+            sleep 2
+          done
           curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
             --retry 10 --retry-delay 2 --retry-all-errors --retry-max-time 90 \
             http://127.0.0.1:20282/health/live

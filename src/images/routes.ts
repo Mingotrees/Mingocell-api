@@ -7,6 +7,7 @@ import rateLimit from "express-rate-limit";
 import multer, { MulterError } from "multer";
 import type { PoolClient } from "pg";
 import sharp from "sharp";
+import { originalFilename, submissionDisplayName } from "./labels.js";
 import { HttpError, requireAuth, type PublicUser } from "../auth/middleware.js";
 import { withTransaction } from "../database/transaction.js";
 import {
@@ -31,9 +32,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 type ImageFormat = "jpeg" | "png" | "tiff";
 type Page = { index: number; width: number; height: number; temporaryPreview: string; previewStorageKey: string };
 type UploadResponse = {
-  image: { id: string; format: ImageFormat; byteSize: number; pageCount: number; sha256: string; uploadedAt: string };
+  image: { id: string; originalFilename: string | null; format: ImageFormat; byteSize: number; pageCount: number; sha256: string; uploadedAt: string };
   submissions: Array<{
     id: string;
+    displayName: string;
     pageIndex: number;
     width: number;
     height: number;
@@ -86,6 +88,7 @@ export function mountImageRoutes(app: Express, options: ImageStorageOptions) {
           const originalStorageKey = storageKey("originals", token, `${token}.${extension}`);
           const publishedPaths: string[] = [];
           const candidate = createUploadResponse(
+            originalFilename(file.originalname),
             inspected.format,
             file.size,
             payloadSha256,
@@ -134,6 +137,36 @@ export function mountImageRoutes(app: Express, options: ImageStorageOptions) {
       }
     },
   );
+
+  app.get("/api/v1/submissions", requireAuth, async (req, res) => {
+    const { limit, status, cursor } = historyQuery(req.query);
+    const ownerId = (res.locals.user as PublicUser).id;
+    const result = await options.pool.query<OwnedSubmission & { cursor_timestamp: string }>(`
+      SELECT s.id, s.page_index, s.width, s.height, s.status, s.created_at,
+        i.original_storage_key, i.original_filename, s.preview_storage_key,
+        i.format, i.byte_size, i.sha256, i.page_count,
+        to_char(s.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_timestamp
+      FROM mingocell_data.submissions s
+      JOIN mingocell_data.images i ON i.id = s.image_id
+      WHERE i.owner_id = $1
+        AND ($2::text IS NULL OR s.status = $2)
+        AND ($3::timestamptz IS NULL OR (s.created_at, s.id) < ($3::timestamptz, $4::uuid))
+      ORDER BY s.created_at DESC, s.id DESC
+      LIMIT $5
+    `, [ownerId, status, cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1]);
+    const hasMore = result.rows.length > limit;
+    const rows = result.rows.slice(0, limit);
+    const last = rows.at(-1);
+    res.json({
+      submissions: rows.map(submissionPayload),
+      pageInfo: {
+        hasMore,
+        nextCursor: hasMore && last ? Buffer.from(JSON.stringify({
+          createdAt: last.cursor_timestamp, id: last.id, status,
+        })).toString("base64url") : null,
+      },
+    });
+  });
 
   app.get("/api/v1/submissions/:id", requireAuth, async (req, res) => {
     const submission = await getOwnedSubmission(options, routeId(req.params.id), (res.locals.user as PublicUser).id);
@@ -274,6 +307,7 @@ async function inspectImage(path: string, token: string, options: ImageStorageOp
 }
 
 function createUploadResponse(
+  filename: string | null,
   format: ImageFormat,
   byteSize: number,
   sha256: string,
@@ -282,11 +316,12 @@ function createUploadResponse(
   const imageId = randomUUID();
   const uploadedAt = new Date().toISOString();
   return {
-    image: { id: imageId, format, byteSize, pageCount: pages.length, sha256, uploadedAt },
+    image: { id: imageId, originalFilename: filename, format, byteSize, pageCount: pages.length, sha256, uploadedAt },
     submissions: pages.map((page) => {
       const id = randomUUID();
       return {
         id,
+        displayName: submissionDisplayName(filename, id, page.index, pages.length),
         pageIndex: page.index,
         width: page.width,
         height: page.height,
@@ -333,8 +368,8 @@ async function persistUpload(
 
     await client.query(
       `INSERT INTO mingocell_data.images
-       (id, owner_id, original_storage_key, sha256, byte_size, format, page_count, uploaded_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        (id, owner_id, original_storage_key, sha256, byte_size, format, page_count, uploaded_at, original_filename)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         response.image.id,
         ownerId,
@@ -344,6 +379,7 @@ async function persistUpload(
         response.image.format,
         response.image.pageCount,
         response.image.uploadedAt,
+        response.image.originalFilename,
       ],
     );
     for (const submission of response.submissions) {
@@ -438,6 +474,7 @@ type OwnedSubmission = {
   status: "uploaded" | "analyzed" | "failed";
   created_at: Date;
   original_storage_key: string;
+  original_filename: string | null;
   preview_storage_key: string;
   format: ImageFormat;
   byte_size: string;
@@ -445,11 +482,41 @@ type OwnedSubmission = {
   page_count: number;
 };
 
+function historyQuery(query: Parameters<RequestHandler>[0]["query"]) {
+  const invalid = () => new HttpError(400, "INVALID_INPUT", "Provide a valid limit, status, and history cursor.");
+  const limitValue = query.limit ?? "20";
+  if (typeof limitValue !== "string" || !/^[1-9]\d?$|^100$/.test(limitValue)) throw invalid();
+  const limit = Number(limitValue);
+  const status = query.status ?? null;
+  if (status !== null && (typeof status !== "string" || !["uploaded", "analyzed", "failed"].includes(status))) {
+    throw invalid();
+  }
+  let cursor: { createdAt: string; id: string } | null = null;
+  if (query.cursor !== undefined) {
+    if (typeof query.cursor !== "string" || query.cursor.length > 512 || !/^[A-Za-z0-9_-]+$/.test(query.cursor)) {
+      throw invalid();
+    }
+    try {
+      const decoded = JSON.parse(Buffer.from(query.cursor, "base64url").toString("utf8"));
+      if (typeof decoded?.createdAt !== "string" || typeof decoded?.id !== "string"
+        || !UUID.test(decoded.id) || decoded.status !== status
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(decoded.createdAt)
+        || new Date(decoded.createdAt).toISOString() !== `${decoded.createdAt.slice(0, 23)}Z`) {
+        throw invalid();
+      }
+      cursor = { createdAt: decoded.createdAt, id: decoded.id };
+    } catch {
+      throw invalid();
+    }
+  }
+  return { limit, status, cursor };
+}
+
 async function getOwnedSubmission(options: ImageStorageOptions, id: string, ownerId: string) {
   if (!UUID.test(id)) throw new HttpError(404, "SUBMISSION_NOT_FOUND", "Submission not found.");
   const result = await options.pool.query<OwnedSubmission>(`
     SELECT s.id, s.page_index, s.width, s.height, s.status, s.created_at,
-      i.original_storage_key, s.preview_storage_key, i.format, i.byte_size, i.sha256, i.page_count
+      i.original_storage_key, i.original_filename, s.preview_storage_key, i.format, i.byte_size, i.sha256, i.page_count
     FROM mingocell_data.submissions s
     JOIN mingocell_data.images i ON i.id = s.image_id
     WHERE s.id = $1 AND i.owner_id = $2
@@ -462,12 +529,14 @@ async function getOwnedSubmission(options: ImageStorageOptions, id: string, owne
 function submissionPayload(submission: OwnedSubmission) {
   return {
     id: submission.id,
+    displayName: submissionDisplayName(submission.original_filename, submission.id, submission.page_index, submission.page_count),
     pageIndex: submission.page_index,
     width: submission.width,
     height: submission.height,
     status: submission.status,
     createdAt: submission.created_at.toISOString(),
     source: {
+      originalFilename: submission.original_filename,
       format: submission.format,
       byteSize: Number(submission.byte_size),
       sha256: submission.sha256,

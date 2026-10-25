@@ -13,6 +13,7 @@ import { createAccount, updateAccount } from "../dist/auth/accounts.js";
 import { migrate } from "../dist/database/migration-runner.js";
 import { hashPassword, normalizeEmail, verifyPassword } from "../dist/auth/passwords.js";
 import { imageStorageOptions, initializeImageStorage } from "../dist/images/storage.js";
+import { analysisTests } from './analysis-integration.mjs';
 
 test("email normalization and salted password verification", async () => {
   assert.equal(normalizeEmail("  Expert@Example.org "), "expert@example.org");
@@ -66,7 +67,7 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
   await migrate(pool);
   await migrate(pool); // Re-running migrations must preserve existing schema/data.
   const migrations = await pool.query("SELECT count(*)::int AS count FROM public.mingocell_migrations");
-  assert.equal(migrations.rows[0].count, 3);
+  assert.equal(migrations.rows[0].count, 5);
   const keptUser = await pool.query("SELECT role FROM mingocell_auth.users WHERE id = $1", [existingUser]);
   assert.equal(keptUser.rows[0].role, "admin");
   await assert.rejects(pool.query("UPDATE mingocell_auth.users SET role = 'maintainer' WHERE id = $1",
@@ -218,12 +219,14 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
     const uploaded = await weekBrowser.upload(singlePage, key);
     assert.equal(uploaded.status, 201);
     assert.equal(uploaded.data.image.format, "tiff");
+    assert.equal(uploaded.data.image.originalFilename, "cell.tif");
+    assert.equal(uploaded.data.submissions[0].displayName, "cell.tif");
     assert.equal(uploaded.data.image.pageCount, 1);
     assert.equal(uploaded.data.submissions.length, 1);
     assert.equal(uploaded.data.submissions[0].width, 288);
     assert.equal(uploaded.data.submissions[0].height, 288);
 
-    const replayed = await weekBrowser.upload(singlePage, key);
+    const replayed = await weekBrowser.upload(singlePage, key, "renamed.tif");
     assert.equal(replayed.status, 201);
     assert.equal(replayed.headers.get("idempotency-replayed"), "true");
     assert.deepEqual(replayed.data, uploaded.data);
@@ -235,6 +238,12 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
     const detail = await weekBrowser.request(`/api/v1/submissions/${submissionId}`);
     assert.equal(detail.status, 200);
     assert.equal(detail.data.status, "uploaded");
+    assert.equal(detail.data.source.originalFilename, "cell.tif");
+    assert.equal(detail.data.displayName, "cell.tif");
+    await pool.query("UPDATE mingocell_data.images SET original_filename = NULL WHERE id = $1", [uploaded.data.image.id]);
+    const legacy = await weekBrowser.request(`/api/v1/submissions/${submissionId}`);
+    assert.equal(legacy.data.source.originalFilename, null);
+    assert.equal(legacy.data.displayName, `Submission ${submissionId}`);
     const original = await weekBrowser.raw(`/api/v1/submissions/${submissionId}/image`);
     assert.equal(original.status, 200);
     assert.equal(original.headers.get("content-type"), "image/tiff");
@@ -264,6 +273,11 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
     assert.equal(multi.status, 201);
     assert.equal(multi.data.image.pageCount, 2);
     assert.deepEqual(multi.data.submissions.map((submission) => submission.pageIndex), [0, 1]);
+    assert.deepEqual(multi.data.submissions.map((submission) => submission.displayName), ["cell.tif — Page 1", "cell.tif — Page 2"]);
+    assert.notEqual(multi.data.image.id, uploaded.data.image.id);
+    const secondPage = await weekBrowser.request(`/api/v1/submissions/${multi.data.submissions[1].id}`);
+    assert.equal(secondPage.data.displayName, "cell.tif — Page 2");
+    assert.equal(secondPage.data.source.originalFilename, "cell.tif");
     const firstPreview = Buffer.from(await (await weekBrowser.raw(multi.data.submissions[0].previewUrl)).arrayBuffer());
     const secondPreview = Buffer.from(await (await weekBrowser.raw(multi.data.submissions[1].previewUrl)).arrayBuffer());
     assert.notDeepEqual((await sharp(firstPreview).stats()).dominant, (await sharp(secondPreview).stats()).dominant);
@@ -348,6 +362,62 @@ test("PostgreSQL-backed authentication lifecycle", { skip: !process.env.TEST_DAT
     const tooManyBytes = Buffer.alloc(5 * 1024 * 1024 + 1, 1);
     assert.equal((await weekBrowser.upload(tooManyBytes, randomUUID())).status, 413);
   });
+
+  await t.test("submission history is owner-only, filtered and stably paginated", async () => {
+    assert.equal((await browser().request("/api/v1/submissions")).status, 401);
+    const ownerId = weekSession.data.user.id;
+    // Exercise microsecond precision and timestamp ties across multiple pages.
+    await pool.query(`UPDATE mingocell_data.submissions s
+      SET created_at = '2026-10-01T12:00:00.123456Z'
+      FROM mingocell_data.images i WHERE i.id = s.image_id AND i.owner_id = $1`, [ownerId]);
+    const expected = await pool.query(`SELECT s.id FROM mingocell_data.submissions s
+      JOIN mingocell_data.images i ON i.id = s.image_id
+      WHERE i.owner_id = $1 ORDER BY s.created_at DESC, s.id DESC`, [ownerId]);
+    assert.ok(expected.rows.length > 2);
+    const ids = [];
+    let cursor = null;
+    do {
+      const page = await weekBrowser.request(`/api/v1/submissions?limit=2${cursor ? `&cursor=${cursor}` : ""}`);
+      assert.equal(page.status, 200);
+      assert.ok(page.data.submissions.length <= 2);
+      assert.ok(page.data.submissions.every((submission) => typeof submission.displayName === "string"));
+      assert.equal(page.data.pageInfo.hasMore, page.data.pageInfo.nextCursor !== null);
+      ids.push(...page.data.submissions.map((submission) => submission.id));
+      cursor = page.data.pageInfo.nextCursor;
+    } while (cursor);
+    assert.deepEqual(ids, expected.rows.map((row) => row.id));
+    await pool.query("UPDATE mingocell_data.submissions SET status = 'failed' WHERE id = $1", [ids[0]]);
+    const filtered = await weekBrowser.request("/api/v1/submissions?status=failed");
+    assert.equal(filtered.status, 200);
+    assert.deepEqual(filtered.data.submissions.map((submission) => submission.id), [ids[0]]);
+    const analyzed = await weekBrowser.request("/api/v1/submissions?status=analyzed");
+    assert.deepEqual(analyzed.data, { submissions: [], pageInfo: { hasMore: false, nextCursor: null } });
+    const first = await weekBrowser.request("/api/v1/submissions?limit=1");
+    assert.equal((await weekBrowser.request(`/api/v1/submissions?status=failed&cursor=${first.data.pageInfo.nextCursor}`)).status, 400);
+    for (const query of ["limit=0", "limit=101", "limit=-1", "limit=1.5", "limit=2&limit=3", "status=reviewed", "cursor=garbage", "cursor="]) {
+      const response = await weekBrowser.request(`/api/v1/submissions?${query}`);
+      assert.equal(response.status, 400, query);
+      assert.equal(response.data.error.code, "INVALID_INPUT");
+    }
+    const otherEmail = `${randomUUID()}@example.org`;
+    await createAccount(pool, otherEmail, password, "pathologist");
+    const other = browser();
+    await other.request("/api/v1/auth/session");
+    await other.request("/api/v1/auth/login", { method: "POST", body: { email: otherEmail, password } });
+    const empty = await other.request("/api/v1/submissions");
+    assert.equal(empty.status, 200);
+    assert.deepEqual(empty.data, { submissions: [], pageInfo: { hasMore: false, nextCursor: null } });
+    const foreignCursor = await other.request(`/api/v1/submissions?cursor=${first.data.pageInfo.nextCursor}`);
+    assert.deepEqual(foreignCursor.data, empty.data);
+  });
+
+  // Separate limiter instance: these cases must not consume the authentication
+  // lifecycle's per-IP request budget.
+  const analysisBase = await start();
+  const analysisBrowser = () => browser(analysisBase);
+  const analysisOwner = analysisBrowser();
+  await analysisOwner.login();
+  await analysisTests(t, {pool, storage: imageStorage, browser: analysisBrowser, owner: analysisOwner, ownerId: weekSession.data.user.id});
 
   await t.test("server enforces expiry, password reset and deactivation", async () => {
     await pool.query(`UPDATE mingocell_auth.sessions SET sess = jsonb_set(sess::jsonb,

@@ -1,0 +1,2 @@
+export const model = {package_id:'mingocells-primary',package_version:1,class_order:['MYO','PMO','MYB','MMZ','NGB','NGS'],architecture_order:['vgg16','inceptionv3','densenet201','resnet152','swin_tiny'],temperature:1.2,abstention_threshold:0.7,device:'cpu'};
+export const prediction = {schema_version:1,package_id:model.package_id,package_version:1,class_order:model.class_order,probabilities:[1,0,0,0,0,0],predicted_class:'MYO',calibrated_confidence:1,normalized_entropy:0,abstained:false};

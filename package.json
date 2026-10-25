@@ -13,6 +13,8 @@
     "start": "NODE_ENV=production node --env-file-if-exists=.env dist/server.js",
     "migrate": "node --env-file-if-exists=.env dist/cli/migrate-database.js",
     "account": "node --env-file-if-exists=.env dist/cli/manage-account.js",
+    "worker": "NODE_ENV=production node --env-file-if-exists=.env dist/cli/classification-worker.js",
+    "package:runtime": "node scripts/package-runtime.mjs",
     "test": "npm run build && node --test tests/*.test.mjs"
   },
   "repository": {

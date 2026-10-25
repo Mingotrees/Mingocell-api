@@ -5,6 +5,7 @@ import helmet from "helmet";
 import { HttpError, type AuthOptions, type PublicUser } from "./auth/middleware.js";
 import { mountAuth } from "./auth/routes.js";
 import { mountImageRoutes } from "./images/routes.js";
+import { mountAnalysisRoutes } from './analysis/routes.js';
 import { checkImageStorage, type ImageStorageOptions } from "./images/storage.js";
 import { logger as defaultLogger, safeErrorType, type Logger, type LogFields } from "./logging.js";
 
@@ -73,7 +74,10 @@ export function createApp(
 
   if (auth) {
     mountAuth(app, auth);
-    if (imageStorage) mountImageRoutes(app, imageStorage);
+    if (imageStorage) {
+      mountImageRoutes(app, imageStorage);
+      mountAnalysisRoutes(app, imageStorage.pool);
+    }
   }
 
   app.use((_req, res) => {
